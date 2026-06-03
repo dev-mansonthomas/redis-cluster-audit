@@ -1,0 +1,84 @@
+version: '3.8'
+
+# 3-shard Redis 6.2.20 cluster (no replicas — matches a typical OSS sharding setup).
+#
+# Fixed IP addresses on a private subnet so address_remap in the Python
+# clients can translate internal IPs back to 127.0.0.1:port.
+#
+#   redis-node-1  172.29.0.10:6777  →  127.0.0.1:6777
+#   redis-node-2  172.29.0.11:6778  →  127.0.0.1:6778
+#   redis-node-3  172.29.0.12:6779  →  127.0.0.1:6779
+
+networks:
+  redis-cluster:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.29.0.0/16
+
+services:
+  redis-node-1:
+    image: redis:6.2.20
+    container_name: redis-node-1
+    networks:
+      redis-cluster:
+        ipv4_address: 172.29.0.10
+    ports:
+      - "6777:6777"
+    command: >
+      redis-server
+      --port 6777
+      --cluster-enabled yes
+      --cluster-config-file nodes.conf
+      --cluster-node-timeout 5000
+      --maxmemory 1gb
+      --maxmemory-policy noeviction
+      --timeout 0
+      --maxclients 10000
+      --slowlog-log-slower-than 10000
+      --slowlog-max-len 128
+      --save ""
+
+  redis-node-2:
+    image: redis:6.2.20
+    container_name: redis-node-2
+    networks:
+      redis-cluster:
+        ipv4_address: 172.29.0.11
+    ports:
+      - "6778:6778"
+    command: >
+      redis-server
+      --port 6778
+      --cluster-enabled yes
+      --cluster-config-file nodes.conf
+      --cluster-node-timeout 5000
+      --maxmemory 1gb
+      --maxmemory-policy noeviction
+      --timeout 0
+      --maxclients 10000
+      --slowlog-log-slower-than 10000
+      --slowlog-max-len 128
+      --save ""
+
+  redis-node-3:
+    image: redis:6.2.20
+    container_name: redis-node-3
+    networks:
+      redis-cluster:
+        ipv4_address: 172.29.0.12
+    ports:
+      - "6779:6779"
+    command: >
+      redis-server
+      --port 6779
+      --cluster-enabled yes
+      --cluster-config-file nodes.conf
+      --cluster-node-timeout 5000
+      --maxmemory 1gb
+      --maxmemory-policy noeviction
+      --timeout 0
+      --maxclients 10000
+      --slowlog-log-slower-than 10000
+      --slowlog-max-len 128
+      --save ""
