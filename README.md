@@ -2,7 +2,7 @@
 
 A read-only audit script for Redis OSS clusters. Connects to a Redis Cluster, collects performance and security data across all shards, and produces a self-contained HTML report.
 
-Zero impact on production — the script stops immediately if the user has write access.
+Read-only by design: it requires a read-only user, and the only write it attempts is a self-expiring canary in its permission check — which a read-only user rejects. If that write unexpectedly succeeds, the key is removed immediately (UNLINK) and the audit aborts before doing anything else.
 
 ---
 
@@ -28,7 +28,7 @@ Zero impact on production — the script stops immediately if the user has write
 
 | Tool | Min version |
 |---|---|
-| Python | 3.8+ |
+| Python | 3.10+ |
 | Docker Desktop | 4.x (local testing only) |
 | redis-cli | 6.x (local cluster init only) |
 
@@ -50,7 +50,7 @@ Starts a 3-shard Redis 6.2.20 cluster, seeds test data, and runs the audit in on
 bash run.sh
 ```
 
-The `.env` file is pre-configured for the local Docker cluster. No changes needed.
+`run.sh` is self-contained: it installs dependencies, starts the Docker cluster, provisions a read-only user, seeds test data, and runs the audit. It uses fixed test credentials and does **not** read `.env` (that file is only for auditing real, external servers).
 
 ---
 
@@ -74,6 +74,10 @@ ACL SETUSER audit_ro on >YOUR_PASSWORD ~* &* nocommands \
   +PING +READONLY +COMMAND
 ```
 
+> Generate this exact line for any username/password with:
+> ```bash
+> python audit.py --print-acl audit_ro YOUR_PASSWORD
+> ```
 > The script performs a write permission check at startup and exits with the ACL command above if the user has write access.
 
 ### Step 2 — Configure `.env`
@@ -149,6 +153,17 @@ CONFIG SET tcp-keepalive 60
 **`maxmemory=0`** — no memory cap. A memory leak or data burst will OOM-kill the process.
 
 **Default user `nopass`** — any client can connect without authentication.
+
+---
+
+## Running the tests
+
+The unit tests use fake Redis clients, so no live server or Docker is needed:
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
 
 ---
 
