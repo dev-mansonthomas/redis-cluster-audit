@@ -1,6 +1,6 @@
 # Spec & Plan — Detection coverage + missing detections
 
-**Status:** planned (not started)
+**Status:** Phase A complete (A1–A3, 24 unit tests green + Docker E2E); Phase B not started
 **Branch:** `fix/code-review-fixes` (Phase 1 code-review fixes already implemented here; this
 is the next feature on top). Nothing committed yet.
 **Date:** 2026-08-19
@@ -151,10 +151,15 @@ Each new reco flows through `generate_recommendations` → renders automatically
 
 ## 6. Progress tracker
 
-Phase A — coverage of existing detections (#2)
-- [ ] A1 — `tests/test_recommendations.py`: C1, C7, C8, C9, C10
-- [ ] A2 — extend `tests/test_security.py`: C2, C3, C4, C5, C6
-- [ ] A3 — fixture triggers A1/A2 live (compose + run.sh + seed) + Docker E2E
+Phase A — coverage of existing detections (#2) — ✅ DONE
+- [x] A1 — `tests/test_recommendations.py`: C1, C7, C8, C9, C10 (6 tests)
+- [x] A2 — extend `tests/test_security.py`: C2, C3, C4, C5, C6 (+ C6 aggregated-count)
+- [x] A3 — fixture triggers live + Docker E2E. **Live-verified:** C1 (node-1 `maxmemory 0`),
+  C2 + C4 (`app_user ~* +@all`), C6 (6 failed AUTHs), C8 (hit ratio 9.6%), C10 (node-1
+  `slowlog 200000`). **Unit-only (impractical/unsafe to simulate live):** C3, C5, C7, C9.
+- [x] Bonus fix (found via E2E): C6 now sums the ACL LOG `count` field instead of counting
+  entries — ACL LOG aggregates identical failures, so a one-source brute-force previously
+  slipped past. `audit.py:analyse_security`.
 
 Phase B — new detections (#3)
 - [ ] B1 — N1 noeviction on capped cache
