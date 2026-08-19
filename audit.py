@@ -557,8 +557,12 @@ def analyse_security(all_node_data: list) -> dict:
 
         # ── ACL log — recent auth failures / permission denials ───────────────
         auth_failures = [e for e in acl_log if str(e.get("reason", "")).lower() in ("auth", "noauth")]
-        if len(auth_failures) > 5:
-            add("MEDIUM", "ACL Log", f"{len(auth_failures)} recent authentication failures in ACL LOG",
+        # ACL LOG aggregates repeated identical failures into a single entry with
+        # a `count`, so sum the counts rather than counting entries — otherwise a
+        # brute-force from one source (one entry, high count) slips past.
+        auth_failure_count = sum(int(e.get("count", 1) or 1) for e in auth_failures)
+        if auth_failure_count > 5:
+            add("MEDIUM", "ACL Log", f"{auth_failure_count} recent authentication failures in ACL LOG",
                 "Multiple failed authentication attempts. Could indicate a misconfigured "
                 "client, leaked credentials, or an active brute-force attempt. "
                 "Check the source IPs in the ACL LOG.", label)

@@ -27,3 +27,47 @@ def test_empty_node_list_is_safe():
     res = audit.analyse_security([])
     assert res["findings"] == []
     assert res["users"] == []
+
+
+# ── Phase A coverage — over-privileged users / ACL log (C2–C6) ────────────────
+
+def _titles(node):
+    return [f["title"] for f in audit.analyse_security([node])["findings"]]
+
+
+def test_named_user_all_commands_flagged(make_user, secure_config):          # C2
+    nd = _node("n:6379", dict(secure_config), [make_user("app", all_commands=True)])
+    assert any("unrestricted command access" in t for t in _titles(nd))
+
+
+def test_named_user_dangerous_flagged(make_user, secure_config):             # C3
+    nd = _node("n:6379", dict(secure_config),
+               [make_user("app", dangerous=True, all_commands=False)])
+    assert any("dangerous command category" in t for t in _titles(nd))
+
+
+def test_named_user_write_all_keys_flagged(make_user, secure_config):        # C4
+    nd = _node("n:6379", dict(secure_config),
+               [make_user("app", write=True, all_commands=False,
+                          dangerous=False, all_keys=True)])
+    assert any("can write to all keys" in t for t in _titles(nd))
+
+
+def test_no_acl_users_flagged(secure_config):                                # C5
+    nd = _node("n:6379", dict(secure_config), [])
+    assert any("ACL data unavailable" in t for t in _titles(nd))
+
+
+def test_acl_log_auth_failures_flagged(make_user, secure_config):            # C6
+    log = [{"reason": "auth"} for _ in range(6)]
+    nd = _node("n:6379", dict(secure_config),
+               [make_user("default", enabled=False)], log=log)
+    assert any("authentication failures" in t for t in _titles(nd))
+
+
+def test_acl_log_auth_failures_aggregated_count(make_user, secure_config):   # C6
+    # ACL LOG aggregates identical failures into ONE entry carrying a count.
+    log = [{"reason": "auth", "count": 6}]
+    nd = _node("n:6379", dict(secure_config),
+               [make_user("default", enabled=False)], log=log)
+    assert any("authentication failures" in t for t in _titles(nd))
