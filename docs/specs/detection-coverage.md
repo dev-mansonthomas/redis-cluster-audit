@@ -198,3 +198,9 @@ container command (not a read-only query — it mutates tracking state); needs a
 `+HOTKEYS`; no LFU policy required; `GET` reply is `[{... 'by-cpu-time-us':[k,v,...],
 'by-net-bytes':[k,v,...] ...}]`. Version-gated via `version_at_least`. 17 unit tests +
 a live-8.6 integration check; nodes < 8.6 are skipped.
+
+Local test fixture: `bash run.sh --hotkeys [N]` starts a Redis **8.10** cluster
+(`docker/docker-compose-8.yml`), grants `+HOTKEYS` to the audit user, runs a Python load
+generator (`seed/hotkey_load.py`) against one big key, then runs `audit.py --hotkeys N` so the
+report's Hot Keys section is populated. Verified E2E on redis:8.10 (hot key at 100% CPU/net).
+Note: Docker Hub has no `redis:8.10.1` tag — the fixture pins `redis:8.10`.

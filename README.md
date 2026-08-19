@@ -119,10 +119,12 @@ redis-cluster-audit/
 ├── requirements.txt
 ├── .env.example          ← production config template
 ├── docker/
-│   ├── docker-compose.yml   ← 3-node Redis 6.2.20 cluster
+│   ├── docker-compose.yml     ← 3-node Redis 6.2.20 cluster (default test)
+│   ├── docker-compose-8.yml   ← 3-node Redis 8.10 cluster (--hotkeys test)
 │   └── init-cluster.sh
 └── seed/
-    └── seed.py              ← loads test data (big keys, slow logs, TTL mix)
+    ├── seed.py                ← loads test data (big keys, slow logs, TTL mix)
+    └── hotkey_load.py         ← concentrated load on one key (for --hotkeys)
 ```
 
 ---
@@ -151,6 +153,12 @@ python audit.py --hotkeys 10   # track for 10 seconds per node
 ```
 
 > ⚠️ This mode is **invasive**: it runs `HOTKEYS START/STOP/RESET`, which mutates the server's tracking state, and it needs a user permitted to run `HOTKEYS` (grant `+HOTKEYS`). It is off by default — the standard audit never runs it. Nodes older than 8.6 are skipped automatically.
+
+**Try it locally** against a throwaway Redis 8.10 cluster — this spins up the fixture, generates load on one key, then runs the HOTKEYS audit so the report's *Hot Keys* section is populated:
+
+```bash
+bash run.sh --hotkeys 10   # 10 = tracking seconds (default 10)
+```
 
 ## Common findings
 
