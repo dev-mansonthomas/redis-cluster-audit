@@ -32,7 +32,7 @@ import sys
 import time
 import html
 import argparse
-from collections import defaultdict
+from collections import defaultdict, Counter
 from datetime import datetime
 
 import redis
@@ -58,6 +58,8 @@ SLOWLOG_ENTRIES  = int(os.getenv("SLOWLOG_MAX_ENTRIES", 25))
 # MEMORY USAGE sampling depth. 0 = examine every element (exact but O(N) on the
 # server) — avoid on production; a small sample gives a good estimate cheaply.
 SCAN_MEMORY_SAMPLES = int(os.getenv("SCAN_MEMORY_SAMPLES", 5))
+# Warn when a single source IP holds more than this many connections (pool misconfig).
+CONN_PER_IP_WARN = int(os.getenv("CONN_PER_IP_WARN", 200))
 
 # LOCAL DOCKER ONLY — maps internal Docker bridge IPs back to 127.0.0.1:port
 # so MOVED redirects work from the Mac host. Set REDIS_DOCKER_REMAP=false for production.
@@ -205,6 +207,7 @@ def collect_config(r: redis.Redis) -> dict:
         "hz", "dynamic-hz", "lazyfree-lazy-eviction",
         "appendonly", "save",
         "tls-port", "aclfile",
+        "latency-monitor-threshold",
     ]
     result = {}
     for key in keys:
@@ -397,6 +400,7 @@ def analyse_connections(client_list_per_node: dict) -> dict:
     idle_buckets = {"<10s": 0, "10s-1min": 0, "1min-10min": 0, ">10min": 0}
     cmd_dist     = defaultdict(int)
     total        = 0
+    default_user_external = 0   # app authenticating as 'default' from a non-loopback IP
 
     for clients in client_list_per_node.values():
         for c in clients:
@@ -416,11 +420,15 @@ def analyse_connections(client_list_per_node: dict) -> dict:
 
             cmd_dist[c.get("cmd", "unknown")] += 1
 
+            if c.get("user") == "default" and not ip.startswith("127.") and ip != "unknown":
+                default_user_external += 1
+
     return {
         "total":        total,
         "per_ip":       dict(sorted(per_ip.items(), key=lambda x: x[1], reverse=True)),
         "idle_buckets": idle_buckets,
         "cmd_dist":     dict(sorted(cmd_dist.items(), key=lambda x: x[1], reverse=True)),
+        "default_user_external": default_user_external,
     }
 
 
@@ -713,6 +721,125 @@ def generate_recommendations(all_node_data: list, conn_analysis: dict,
                 break
         except (ValueError, TypeError):
             pass
+
+    # ── Eviction policy on a capped cache ─────────────────────────────────────
+    for nd in all_node_data:
+        maxmem = str(nd["config"].get("maxmemory", "0"))
+        if maxmem not in ("0", "", "N/A") and nd["config"].get("maxmemory-policy") == "noeviction":
+            recs.append({
+                "severity": "MEDIUM",
+                "title":    "maxmemory-policy is noeviction on a capped instance",
+                "detail":   "With a maxmemory cap and noeviction, Redis rejects writes with an OOM "
+                            "error once full instead of evicting cold data. For a cache, use "
+                            "allkeys-lru or allkeys-lfu.",
+            })
+            break
+
+    # ── Application connecting as the 'default' user ──────────────────────────
+    if conn_analysis.get("default_user_external", 0) > 0:
+        recs.append({
+            "severity": "HIGH",
+            "title":    "Application connecting as the 'default' user",
+            "detail":   f"{conn_analysis['default_user_external']} non-loopback client(s) are "
+                        "authenticated as 'default'. Applications should use a dedicated, "
+                        "least-privilege ACL user scoped to the keys and commands they need.",
+        })
+
+    # ── Connection concentration from a single IP ─────────────────────────────
+    for ip, count in conn_analysis.get("per_ip", {}).items():
+        if count > CONN_PER_IP_WARN and ip not in ("127.0.0.1", "unknown"):
+            recs.append({
+                "severity": "MEDIUM",
+                "title":    f"{count} connections from a single IP ({ip})",
+                "detail":   "A single host holds a very large number of connections — often an "
+                            "oversized or leaking client pool, or no connection multiplexing. "
+                            "Right-size the pool and enable idle-connection eviction.",
+            })
+            break
+
+    # ── Monolithic-String data model ──────────────────────────────────────────
+    total_scanned = keyspace.get("total_scanned", 0)
+    types = keyspace.get("type_distribution", {})
+    big_keys = keyspace.get("big_keys", [])
+    if total_scanned > 0 and types.get("string", 0) / total_scanned >= 0.9:
+        biggest = big_keys[0] if big_keys else None
+        if biggest and biggest.get("type") == "string" and biggest.get("size_bytes", 0) >= 100_000:
+            recs.append({
+                "severity": "MEDIUM",
+                "title":    "Data modelled as large monolithic strings",
+                "detail":   "Almost all keys are Strings and the largest values are big serialised "
+                            "blobs. Reading one field means fetching and deserialising the whole "
+                            "value. Model records as Hash or JSON for field-level access "
+                            "(HGET / JSON.GET), and cap value size.",
+            })
+
+    # ── Memory fragmentation ──────────────────────────────────────────────────
+    for nd in all_node_data:
+        try:
+            frag = float(nd["info"].get("mem_fragmentation_ratio", 0))
+        except (ValueError, TypeError):
+            continue
+        if frag > 1.5:
+            recs.append({
+                "severity": "MEDIUM",
+                "title":    f"High memory fragmentation ratio ({frag})",
+                "detail":   "The allocator holds much more RSS than live data. Consider enabling "
+                            "activedefrag, running MEMORY PURGE, or (last resort) a rolling restart. "
+                            "Often follows a memory peak — check used_memory_peak.",
+            })
+            break
+
+    # ── Latency monitoring ────────────────────────────────────────────────────
+    for nd in all_node_data:
+        if str(nd["config"].get("latency-monitor-threshold", "0")) in ("0", "", "N/A"):
+            recs.append({
+                "severity": "LOW",
+                "title":    "Latency monitor disabled (latency-monitor-threshold=0)",
+                "detail":   "The built-in latency monitor is off, so LATENCY LATEST stays empty and "
+                            "spikes go unrecorded. Set latency-monitor-threshold (e.g. 100 ms).",
+            })
+            break
+    if any(nd.get("latency") for nd in all_node_data):
+        recs.append({
+            "severity": "MEDIUM",
+            "title":    "Latency spikes recorded (LATENCY LATEST)",
+            "detail":   "One or more nodes recorded latency events. Inspect LATENCY LATEST / "
+                        "LATENCY HISTORY per event type (fork, aof-write, expire-cycle, command) "
+                        "to find the cause.",
+        })
+
+    # ── Both AOF and RDB enabled ──────────────────────────────────────────────
+    for nd in all_node_data:
+        aof  = nd["config"].get("appendonly", "no")
+        save = nd["config"].get("save", "")
+        if aof == "yes" and save and save not in ('""', "", "N/A"):
+            recs.append({
+                "severity": "LOW",
+                "title":    "Both AOF and RDB persistence are enabled",
+                "detail":   "For a pure cache whose data is reconstructible, running both AOF "
+                            "(fsync) and RDB (fork) adds I/O and latency for little benefit. "
+                            "Consider RDB-only, or no persistence, if a cold cache is acceptable.",
+            })
+            break
+
+    # ── Hot key (heuristic from slow log; prefer HOTKEYS on Redis >= 8.6) ──────
+    slow_keys = []
+    for nd in all_node_data:
+        for e in nd.get("slowlog", []):
+            parts = str(e.get("command", "")).split()
+            if len(parts) >= 2:
+                slow_keys.append(parts[1])
+    if slow_keys:
+        top_key, top_count = Counter(slow_keys).most_common(1)[0]
+        if top_count >= 5 and top_count / len(slow_keys) >= 0.5:
+            recs.append({
+                "severity": "MEDIUM",
+                "title":    f"Hot key in slow log: {top_key} ({top_count} slow ops)",
+                "detail":   "A single key dominates the slow log — a hot key concentrating load on "
+                            "one shard's single thread. Split the value, add a client-side "
+                            "near-cache (CLIENT TRACKING), or shard it. On Redis >= 8.6 confirm "
+                            "with the HOTKEYS command.",
+            })
 
     return recs
 
