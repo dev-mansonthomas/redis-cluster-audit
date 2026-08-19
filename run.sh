@@ -58,6 +58,15 @@ for port in 6777 6778 6779; do
     echo "$ACL_CMD" | redis-cli -p "$port" > /dev/null
     echo "  :$port — OK"
 done
+# Extra bad practices so the demo exercises more of the auditor:
+#   - an over-privileged application user (~* +@all) — a common real mistake
+#   - a few failed AUTH attempts to populate the ACL LOG (brute-force signal)
+echo "  + over-privileged app_user + failed-auth entries (demo only)"
+APP_ACL="ACL SETUSER app_user on >app_pass ~* +@all"
+for port in 6777 6778 6779; do echo "$APP_ACL" | redis-cli -p "$port" > /dev/null; done
+for _ in 1 2 3 4 5 6; do
+    redis-cli -p 6777 --user app_user --pass wrongpass --no-auth-warning ping > /dev/null 2>&1 || true
+done
 echo ""
 
 # ── 5. Seed data (as the write-capable default user, NOT audit_ro) ────────────

@@ -31,11 +31,11 @@ services:
       --cluster-enabled yes
       --cluster-config-file nodes.conf
       --cluster-node-timeout 5000
-      --maxmemory 1gb
+      --maxmemory 0
       --maxmemory-policy noeviction
       --timeout 0
       --maxclients 10000
-      --slowlog-log-slower-than 10000
+      --slowlog-log-slower-than 200000
       --slowlog-max-len 128
       --save ""
 

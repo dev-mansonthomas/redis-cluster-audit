@@ -122,6 +122,16 @@ def seed_normal_keys(rc):
     print("  Normal keys written.")
 
 
+def generate_hits_and_misses(rc):
+    """Drive the cache hit ratio below 80% (mostly misses) so the audit flags it."""
+    print("  Generating cache hits/misses...")
+    for i in range(50):
+        rc.get(f"app:session:with-ttl:{i}")      # hits
+    for i in range(500):
+        rc.get(f"app:nonexistent:{i}")            # misses
+    print("  Hits/misses generated.")
+
+
 def trigger_slow_logs(node_connections):
     """
     Lower the slowlog threshold to 0 µs so every command is logged,
@@ -178,6 +188,7 @@ def main():
 
     seed_big_keys(rc)
     seed_normal_keys(rc)
+    generate_hits_and_misses(rc)
     trigger_slow_logs(node_conns)
 
     # Show a quick summary
