@@ -7,7 +7,9 @@ Usage:
     cp .env.example .env          # fill in your credentials
     python audit.py               # produces report.html in the current directory
 
-What this script audits (read-only, no side effects on production):
+What this script audits (requires a read-only user — the only write attempted
+is a self-expiring canary in the permission check below, which a read-only user
+rejects, so a correctly-provisioned audit makes no changes to production):
     1.  Permission check     — exits if user has write access, prints ACL creation script.
     2.  Cluster topology     — shard list, roles, Redis version.
     3.  Configuration        — maxclients, timeout, tcp-keepalive, maxmemory, eviction,
@@ -29,7 +31,8 @@ import os
 import sys
 import time
 import html
-from collections import defaultdict
+import argparse
+from collections import defaultdict, Counter
 from datetime import datetime
 
 import redis
@@ -52,6 +55,11 @@ USERNAME         = os.getenv("REDIS_USERNAME") or None
 BIG_KEY_TOP_N    = int(os.getenv("BIG_KEY_TOP_N", 30))
 SCAN_SAMPLE_SIZE = int(os.getenv("SCAN_SAMPLE_SIZE", 5000))
 SLOWLOG_ENTRIES  = int(os.getenv("SLOWLOG_MAX_ENTRIES", 25))
+# MEMORY USAGE sampling depth. 0 = examine every element (exact but O(N) on the
+# server) — avoid on production; a small sample gives a good estimate cheaply.
+SCAN_MEMORY_SAMPLES = int(os.getenv("SCAN_MEMORY_SAMPLES", 5))
+# Warn when a single source IP holds more than this many connections (pool misconfig).
+CONN_PER_IP_WARN = int(os.getenv("CONN_PER_IP_WARN", 200))
 
 # LOCAL DOCKER ONLY — maps internal Docker bridge IPs back to 127.0.0.1:port
 # so MOVED redirects work from the Mac host. Set REDIS_DOCKER_REMAP=false for production.
@@ -68,25 +76,37 @@ OUTPUT_FILE = "report.html"
 # ACL script shown when the user has write access
 # ---------------------------------------------------------------------------
 
-READONLY_ACL_SCRIPT = """
--- Run this on every Redis node as an admin user:
+# Single source of truth for the read-only audit user's command grants.
+# run.sh provisions the user from this exact list via `audit.py --print-acl`,
+# so the printed customer script and the local test setup can never drift.
+READONLY_ACL_COMMANDS = [
+    "+INFO", "+CONFIG|GET",
+    "+SLOWLOG|GET", "+SLOWLOG|LEN",
+    "+MEMORY|USAGE", "+MEMORY|DOCTOR", "+MEMORY|STATS",
+    "+CLIENT|LIST",
+    "+DBSIZE",
+    "+CLUSTER|INFO", "+CLUSTER|NODES", "+CLUSTER|SLOTS",
+    "+CLUSTER|SHARDS", "+CLUSTER|KEYSLOT", "+CLUSTER|MYID",
+    "+SCAN", "+TYPE", "+TTL", "+OBJECT|ENCODING", "+OBJECT|IDLETIME",
+    "+ACL|LIST", "+ACL|USERS", "+ACL|CAT", "+ACL|LOG",
+    "+LATENCY|LATEST", "+LATENCY|HISTORY",
+    "+PING", "+READONLY", "+COMMAND",
+]
 
-ACL SETUSER audit_ro on >{YOUR_PASSWORD} ~* &* nocommands \\
-  +INFO +CONFIG|GET \\
-  +SLOWLOG|GET +SLOWLOG|LEN \\
-  +MEMORY|USAGE +MEMORY|DOCTOR +MEMORY|STATS \\
-  +CLIENT|LIST \\
-  +DBSIZE \\
-  +CLUSTER|INFO +CLUSTER|NODES +CLUSTER|SLOTS +CLUSTER|SHARDS +CLUSTER|KEYSLOT +CLUSTER|MYID \\
-  +SCAN +TYPE +TTL +OBJECT|ENCODING +OBJECT|IDLETIME \\
-  +ACL|LIST +ACL|USERS +ACL|CAT +ACL|LOG \\
-  +LATENCY|LATEST +LATENCY|HISTORY \\
-  +PING +READONLY +COMMAND
 
--- Then set in your .env:
---   REDIS_USERNAME=audit_ro
---   REDIS_PASSWORD={YOUR_PASSWORD}
-""".strip()
+def build_acl_setuser(user: str, password: str) -> str:
+    """Build the `ACL SETUSER` line that grants exactly the read-only audit grants."""
+    grants = " ".join(READONLY_ACL_COMMANDS)
+    return f"ACL SETUSER {user} on >{password} ~* &* nocommands {grants}"
+
+
+READONLY_ACL_SCRIPT = (
+    "-- Run this on every Redis node as an admin user:\n\n"
+    + build_acl_setuser("audit_ro", "{YOUR_PASSWORD}")
+    + "\n\n-- Then set in your .env:\n"
+    + "--   REDIS_USERNAME=audit_ro\n"
+    + "--   REDIS_PASSWORD={YOUR_PASSWORD}"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -98,7 +118,10 @@ def connect_cluster() -> RedisCluster:
         startup_nodes=STARTUP_NODES,
         password=PASSWORD,
         decode_responses=True,
-        skip_full_coverage_check=True,
+        # Tolerate partial slot coverage: an audit is often pointed at a
+        # degraded cluster (a primary down / mid-resharding). This is the
+        # real redis-py kwarg — skip_full_coverage_check is a legacy no-op.
+        require_full_coverage=False,
         socket_timeout=10,
         socket_connect_timeout=5,
     )
@@ -129,20 +152,16 @@ def node_direct_connection(node) -> redis.Redis:
 
 def check_permissions(rc: RedisCluster):
     """
-    Try to write a canary key. If it succeeds the user has write access — stop.
-    If it raises NoPermissionError / NOPERM the user is read-only — proceed.
+    Verify the connection is read-only by attempting a single throwaway write.
+
+    With the recommended read-only ACL user the write is rejected (NOPERM) and
+    nothing is ever written. If it unexpectedly succeeds, the user can modify
+    data: the canary is removed immediately (UNLINK) and the audit aborts so it
+    never runs with a write-capable account against production.
     """
     CANARY = "__audit_permission_canary__"
     try:
         rc.set(CANARY, "1", ex=5)
-        print("\n" + "=" * 70)
-        print("STOP — the Redis user has WRITE access.")
-        print("The audit must run with a READ-ONLY user to avoid any risk")
-        print("of accidental data modification on a production database.")
-        print("\nCreate a read-only user with this ACL command:\n")
-        print(READONLY_ACL_SCRIPT)
-        print("=" * 70 + "\n")
-        sys.exit(1)
     except redis.exceptions.NoPermissionError:
         return
     except redis.exceptions.ResponseError as e:
@@ -150,6 +169,25 @@ def check_permissions(rc: RedisCluster):
         if "NOPERM" in err or "READONLY" in err or "NOAUTH" in err:
             return
         raise
+
+    # The write succeeded — this user has write access. Undo it right away.
+    try:
+        rc.unlink(CANARY)
+    except Exception:
+        try:
+            rc.delete(CANARY)
+        except Exception:
+            pass
+
+    print("\n" + "=" * 70)
+    print("STOP — the Redis user has WRITE access.")
+    print("The audit must run with a READ-ONLY user to avoid any risk")
+    print("of accidental data modification on a production database.")
+    print("(The canary key just written was removed immediately.)")
+    print("\nCreate a read-only user with this ACL command:\n")
+    print(READONLY_ACL_SCRIPT)
+    print("=" * 70 + "\n")
+    sys.exit(1)
 
 
 # ---------------------------------------------------------------------------
@@ -169,6 +207,7 @@ def collect_config(r: redis.Redis) -> dict:
         "hz", "dynamic-hz", "lazyfree-lazy-eviction",
         "appendonly", "save",
         "tls-port", "aclfile",
+        "latency-monitor-threshold",
     ]
     result = {}
     for key in keys:
@@ -299,27 +338,43 @@ def scan_keyspace(node_connections: list) -> dict:
 
         while True:
             cursor, keys = r.scan(cursor=cursor, count=100)
-            for key in keys:
-                if scanned >= SCAN_SAMPLE_SIZE:
-                    break
 
-                key_type = r.type(key)
-                type_dist[key_type] += 1
+            remaining = SCAN_SAMPLE_SIZE - scanned
+            batch = keys[:remaining] if remaining > 0 else []
+            if batch:
+                # One pipeline per SCAN page instead of 3 blocking round-trips
+                # per key. These are direct per-node connections, so there is
+                # no CROSSSLOT concern — the node owns all the keys it returned.
+                pipe = r.pipeline(transaction=False)
+                for key in batch:
+                    pipe.type(key)
+                    pipe.ttl(key)
+                    pipe.memory_usage(key, samples=SCAN_MEMORY_SAMPLES)
+                results = pipe.execute()
 
-                ttl = r.ttl(key)
-                if ttl == -1:
-                    ttl_dist["no_ttl"] += 1
-                elif ttl == -2:
-                    ttl_dist["expired"] += 1
-                else:
-                    ttl_dist["has_ttl"] += 1
-                    if ttl < 3600:
-                        expiring_soon.append({"key": key, "ttl": ttl})
+                for i, key in enumerate(batch):
+                    key_type = results[i * 3]
+                    ttl      = results[i * 3 + 1]
+                    size     = results[i * 3 + 2] or 0
 
-                size = r.memory_usage(key, samples=0) or 0
-                big_keys.append({"key": key, "size_bytes": size, "type": key_type, "ttl": ttl})
+                    # Key expired between SCAN and read — skip the ghost so it
+                    # doesn't pollute the type/TTL distributions or big-keys.
+                    if key_type == "none":
+                        continue
 
-                scanned += 1
+                    type_dist[key_type] += 1
+
+                    if ttl == -1:
+                        ttl_dist["no_ttl"] += 1
+                    elif ttl == -2:
+                        ttl_dist["expired"] += 1
+                    else:
+                        ttl_dist["has_ttl"] += 1
+                        if ttl < 3600:
+                            expiring_soon.append({"key": key, "ttl": ttl})
+
+                    big_keys.append({"key": key, "size_bytes": size, "type": key_type, "ttl": ttl})
+                    scanned += 1
 
             if cursor == 0 or scanned >= SCAN_SAMPLE_SIZE:
                 break
@@ -345,6 +400,7 @@ def analyse_connections(client_list_per_node: dict) -> dict:
     idle_buckets = {"<10s": 0, "10s-1min": 0, "1min-10min": 0, ">10min": 0}
     cmd_dist     = defaultdict(int)
     total        = 0
+    default_user_external = 0   # app authenticating as 'default' from a non-loopback IP
 
     for clients in client_list_per_node.values():
         for c in clients:
@@ -364,11 +420,15 @@ def analyse_connections(client_list_per_node: dict) -> dict:
 
             cmd_dist[c.get("cmd", "unknown")] += 1
 
+            if c.get("user") == "default" and not ip.startswith("127.") and ip != "unknown":
+                default_user_external += 1
+
     return {
         "total":        total,
         "per_ip":       dict(sorted(per_ip.items(), key=lambda x: x[1], reverse=True)),
         "idle_buckets": idle_buckets,
         "cmd_dist":     dict(sorted(cmd_dist.items(), key=lambda x: x[1], reverse=True)),
+        "default_user_external": default_user_external,
     }
 
 
@@ -409,150 +469,133 @@ def compute_stats_summary(all_node_data: list) -> dict:
 
 def analyse_security(all_node_data: list) -> dict:
     """
-    Consolidate security findings from config + ACL data.
-    Returns a list of findings with severity and detail.
+    Consolidate security findings from config + ACL data across EVERY node.
+
+    In a Redis Cluster, ACLs and network config are per-node, so each primary
+    is inspected. Identical findings are deduplicated; a finding present on only
+    some nodes is annotated with the affected node labels.
     """
+    if not all_node_data:
+        return {"findings": [], "users": [], "acl_log": []}
+
+    n_nodes = len(all_node_data)
+    agg = {}  # (category, title) -> {severity, category, title, detail, nodes:set}
+
+    def add(severity, category, title, detail, node):
+        entry = agg.get((category, title))
+        if entry is None:
+            agg[(category, title)] = {
+                "severity": severity, "category": category,
+                "title": title, "detail": detail, "nodes": {node},
+            }
+        else:
+            entry["nodes"].add(node)
+
+    for nd in all_node_data:
+        label    = nd.get("label", "?")
+        cfg      = nd.get("config", {})
+        acl_data = nd.get("acl_data", {})
+        users    = acl_data.get("users", [])
+        acl_log  = acl_data.get("log", [])
+
+        # ── ACL user analysis ─────────────────────────────────────────────────
+        for user in users:
+            name = user["name"]
+
+            if name == "default" and user["enabled"] and user["nopass"]:
+                add("CRITICAL", "ACL", "Default user active with no password (nopass)",
+                    "The 'default' user has no password. Any client can connect "
+                    "without authentication. Disable or password-protect the default user: "
+                    "ACL SETUSER default off", label)
+
+            if name == "default" and user["enabled"] and user["has_all_commands"]:
+                add("HIGH", "ACL", "Default user has full command access (+@all)",
+                    "The default user can run every command including FLUSHALL, CONFIG, DEBUG. "
+                    "Restrict to minimum required commands or disable the default user.", label)
+
+            if user["enabled"] and user["has_all_commands"] and name != "default":
+                add("HIGH", "ACL", f"User '{name}' has unrestricted command access (+@all)",
+                    f"User '{name}' can execute any Redis command. Scope down to only the "
+                    "commands this user actually needs.", label)
+
+            if user["enabled"] and user["has_dangerous"] and not user["has_all_commands"] and name != "default":
+                add("MEDIUM", "ACL", f"User '{name}' has access to dangerous command category",
+                    f"User '{name}' has +@dangerous or +@admin. These categories include "
+                    "DEBUG, CONFIG (write), FLUSHALL, SLAVEOF, etc. Review if this is intentional.", label)
+
+            if user["enabled"] and user["has_write"] and user["has_all_keys"] and name != "default":
+                add("MEDIUM", "ACL", f"User '{name}' can write to all keys (~*)",
+                    f"User '{name}' has write access to all keyspaces (~*). "
+                    "Restrict key patterns to the namespace this user owns (e.g. ~app:*).", label)
+
+        # Flag if no ACL data was available (likely no ACL configured at all)
+        if not users:
+            add("HIGH", "ACL", "ACL data unavailable — may be running without ACL",
+                "Could not retrieve ACL LIST. Redis may be running without ACL configuration "
+                "(pre-Redis 6 mode or permission denied). All clients share the same access level.", label)
+
+        # ── Network exposure ──────────────────────────────────────────────────
+        bind_val = cfg.get("bind", "")
+        if "0.0.0.0" in bind_val or bind_val == "":
+            add("HIGH", "Network", f"Redis listening on all interfaces (bind: '{bind_val or 'unset'}')",
+                "Redis is reachable from any network interface. "
+                "Bind to the specific interface used by application servers only "
+                "(e.g. bind 127.0.0.1 10.0.0.5).", label)
+
+        if cfg.get("protected-mode") == "no":
+            add("HIGH", "Network", "protected-mode is disabled",
+                "With protected-mode off, Redis accepts connections from any IP "
+                "even without a password when bind is not restricted. "
+                "Re-enable: CONFIG SET protected-mode yes", label)
+
+        tls_port = cfg.get("tls-port", "0")
+        if str(tls_port) in ("0", "", "N/A"):
+            add("MEDIUM", "Network", "TLS not configured",
+                "Connections to Redis are unencrypted. Credentials and data travel in clear text. "
+                "Configure tls-port and provide certificates (tls-cert-file, tls-key-file).", label)
+
+        # ── Persistence / data safety ─────────────────────────────────────────
+        aof  = cfg.get("appendonly", "no")
+        save = cfg.get("save", "")
+        if aof == "no" and (not save or save == '""' or save == ""):
+            add("MEDIUM", "Persistence", "No persistence configured (no RDB save, no AOF)",
+                "All data will be lost on restart. For a cache this may be acceptable, "
+                "but the application must be able to handle a cold cache gracefully. "
+                "Consider enabling at minimum RDB snapshots (save 900 1).", label)
+
+        # ── ACL log — recent auth failures / permission denials ───────────────
+        auth_failures = [e for e in acl_log if str(e.get("reason", "")).lower() in ("auth", "noauth")]
+        # ACL LOG aggregates repeated identical failures into a single entry with
+        # a `count`, so sum the counts rather than counting entries — otherwise a
+        # brute-force from one source (one entry, high count) slips past.
+        auth_failure_count = sum(int(e.get("count", 1) or 1) for e in auth_failures)
+        if auth_failure_count > 5:
+            add("MEDIUM", "ACL Log", f"{auth_failure_count} recent authentication failures in ACL LOG",
+                "Multiple failed authentication attempts. Could indicate a misconfigured "
+                "client, leaked credentials, or an active brute-force attempt. "
+                "Check the source IPs in the ACL LOG.", label)
+
+        perm_denials = [e for e in acl_log if str(e.get("reason", "")).lower() == "command"]
+        if perm_denials:
+            add("LOW", "ACL Log", f"{len(perm_denials)} recent permission-denied entries in ACL LOG",
+                "A client is trying to run commands it is not allowed to execute. "
+                "This may indicate a misconfigured application account. "
+                "Review the ACL LOG for usernames and commands.", label)
+
     findings = []
-
-    # Use first node for config checks (should be identical across the cluster)
-    cfg      = all_node_data[0]["config"]
-    acl_data = all_node_data[0].get("acl_data", {})
-    users    = acl_data.get("users", [])
-    acl_log  = acl_data.get("log", [])
-
-    # ── ACL user analysis ────────────────────────────────────────────────────
-
-    for user in users:
-        name = user["name"]
-
-        if name == "default" and user["enabled"] and user["nopass"]:
-            findings.append({
-                "severity": "CRITICAL",
-                "category": "ACL",
-                "title":    "Default user active with no password (nopass)",
-                "detail":   "The 'default' user has no password. Any client can connect "
-                            "without authentication. Disable or password-protect the default user: "
-                            "ACL SETUSER default off",
-            })
-
-        if name == "default" and user["enabled"] and user["has_all_commands"]:
-            findings.append({
-                "severity": "HIGH",
-                "category": "ACL",
-                "title":    "Default user has full command access (+@all)",
-                "detail":   "The default user can run every command including FLUSHALL, CONFIG, DEBUG. "
-                            "Restrict to minimum required commands or disable the default user.",
-            })
-
-        if user["enabled"] and user["has_all_commands"] and name != "default":
-            findings.append({
-                "severity": "HIGH",
-                "category": "ACL",
-                "title":    f"User '{name}' has unrestricted command access (+@all)",
-                "detail":   f"User '{name}' can execute any Redis command. Scope down to only the "
-                            "commands this user actually needs.",
-            })
-
-        if user["enabled"] and user["has_dangerous"] and not user["has_all_commands"] and name != "default":
-            findings.append({
-                "severity": "MEDIUM",
-                "category": "ACL",
-                "title":    f"User '{name}' has access to dangerous command category",
-                "detail":   f"User '{name}' has +@dangerous or +@admin. These categories include "
-                            "DEBUG, CONFIG (write), FLUSHALL, SLAVEOF, etc. Review if this is intentional.",
-            })
-
-        if user["enabled"] and user["has_write"] and user["has_all_keys"] and name != "default":
-            findings.append({
-                "severity": "MEDIUM",
-                "category": "ACL",
-                "title":    f"User '{name}' can write to all keys (~*)",
-                "detail":   f"User '{name}' has write access to all keyspaces (~*). "
-                            "Restrict key patterns to the namespace this user owns (e.g. ~app:*).",
-            })
-
-    # Flag if no ACL data was available (likely no ACL configured at all)
-    if not users:
+    for entry in agg.values():
+        detail = entry["detail"]
+        if len(entry["nodes"]) < n_nodes:
+            detail = f"{detail} (Affected nodes: {', '.join(sorted(entry['nodes']))})"
         findings.append({
-            "severity": "HIGH",
-            "category": "ACL",
-            "title":    "ACL data unavailable — may be running without ACL",
-            "detail":   "Could not retrieve ACL LIST. Redis may be running without ACL configuration "
-                        "(pre-Redis 6 mode or permission denied). All clients share the same access level.",
+            "severity": entry["severity"], "category": entry["category"],
+            "title": entry["title"], "detail": detail,
         })
 
-    # ── Network exposure ─────────────────────────────────────────────────────
-
-    bind_val = cfg.get("bind", "")
-    if "0.0.0.0" in bind_val or bind_val == "":
-        findings.append({
-            "severity": "HIGH",
-            "category": "Network",
-            "title":    f"Redis listening on all interfaces (bind: '{bind_val or 'unset'}')",
-            "detail":   "Redis is reachable from any network interface. "
-                        "Bind to the specific interface used by application servers only "
-                        "(e.g. bind 127.0.0.1 10.0.0.5).",
-        })
-
-    if cfg.get("protected-mode") == "no":
-        findings.append({
-            "severity": "HIGH",
-            "category": "Network",
-            "title":    "protected-mode is disabled",
-            "detail":   "With protected-mode off, Redis accepts connections from any IP "
-                        "even without a password when bind is not restricted. "
-                        "Re-enable: CONFIG SET protected-mode yes",
-        })
-
-    tls_port = cfg.get("tls-port", "0")
-    if str(tls_port) in ("0", "", "N/A"):
-        findings.append({
-            "severity": "MEDIUM",
-            "category": "Network",
-            "title":    "TLS not configured",
-            "detail":   "Connections to Redis are unencrypted. Credentials and data travel in clear text. "
-                        "Configure tls-port and provide certificates (tls-cert-file, tls-key-file).",
-        })
-
-    # ── Persistence / data safety ─────────────────────────────────────────────
-
-    aof = cfg.get("appendonly", "no")
-    save = cfg.get("save", "")
-    if aof == "no" and (not save or save == '""' or save == ""):
-        findings.append({
-            "severity": "MEDIUM",
-            "category": "Persistence",
-            "title":    "No persistence configured (no RDB save, no AOF)",
-            "detail":   "All data will be lost on restart. For a cache this may be acceptable, "
-                        "but the application must be able to handle a cold cache gracefully. "
-                        "Consider enabling at minimum RDB snapshots (save 900 1).",
-        })
-
-    # ── ACL log — recent auth failures ───────────────────────────────────────
-
-    auth_failures = [e for e in acl_log if str(e.get("reason", "")).lower() in ("auth", "noauth")]
-    if len(auth_failures) > 5:
-        findings.append({
-            "severity": "MEDIUM",
-            "category": "ACL Log",
-            "title":    f"{len(auth_failures)} recent authentication failures in ACL LOG",
-            "detail":   "Multiple failed authentication attempts. Could indicate a misconfigured "
-                        "client, leaked credentials, or an active brute-force attempt. "
-                        "Check the source IPs in the ACL LOG.",
-        })
-
-    perm_denials = [e for e in acl_log if str(e.get("reason", "")).lower() == "command"]
-    if perm_denials:
-        findings.append({
-            "severity": "LOW",
-            "category": "ACL Log",
-            "title":    f"{len(perm_denials)} recent permission-denied entries in ACL LOG",
-            "detail":   "A client is trying to run commands it is not allowed to execute. "
-                        "This may indicate a misconfigured application account. "
-                        "Review the ACL LOG for usernames and commands.",
-        })
-
-    return {"findings": findings, "users": users, "acl_log": acl_log}
+    # Representative ACL user list / log for the report tables (first node).
+    first_acl = all_node_data[0].get("acl_data", {})
+    return {"findings": findings, "users": first_acl.get("users", []),
+            "acl_log": first_acl.get("log", [])}
 
 
 # ---------------------------------------------------------------------------
@@ -678,6 +721,125 @@ def generate_recommendations(all_node_data: list, conn_analysis: dict,
                 break
         except (ValueError, TypeError):
             pass
+
+    # ── Eviction policy on a capped cache ─────────────────────────────────────
+    for nd in all_node_data:
+        maxmem = str(nd["config"].get("maxmemory", "0"))
+        if maxmem not in ("0", "", "N/A") and nd["config"].get("maxmemory-policy") == "noeviction":
+            recs.append({
+                "severity": "MEDIUM",
+                "title":    "maxmemory-policy is noeviction on a capped instance",
+                "detail":   "With a maxmemory cap and noeviction, Redis rejects writes with an OOM "
+                            "error once full instead of evicting cold data. For a cache, use "
+                            "allkeys-lru or allkeys-lfu.",
+            })
+            break
+
+    # ── Application connecting as the 'default' user ──────────────────────────
+    if conn_analysis.get("default_user_external", 0) > 0:
+        recs.append({
+            "severity": "HIGH",
+            "title":    "Application connecting as the 'default' user",
+            "detail":   f"{conn_analysis['default_user_external']} non-loopback client(s) are "
+                        "authenticated as 'default'. Applications should use a dedicated, "
+                        "least-privilege ACL user scoped to the keys and commands they need.",
+        })
+
+    # ── Connection concentration from a single IP ─────────────────────────────
+    for ip, count in conn_analysis.get("per_ip", {}).items():
+        if count > CONN_PER_IP_WARN and ip not in ("127.0.0.1", "unknown"):
+            recs.append({
+                "severity": "MEDIUM",
+                "title":    f"{count} connections from a single IP ({ip})",
+                "detail":   "A single host holds a very large number of connections — often an "
+                            "oversized or leaking client pool, or no connection multiplexing. "
+                            "Right-size the pool and enable idle-connection eviction.",
+            })
+            break
+
+    # ── Monolithic-String data model ──────────────────────────────────────────
+    total_scanned = keyspace.get("total_scanned", 0)
+    types = keyspace.get("type_distribution", {})
+    big_keys = keyspace.get("big_keys", [])
+    if total_scanned > 0 and types.get("string", 0) / total_scanned >= 0.9:
+        biggest = big_keys[0] if big_keys else None
+        if biggest and biggest.get("type") == "string" and biggest.get("size_bytes", 0) >= 100_000:
+            recs.append({
+                "severity": "MEDIUM",
+                "title":    "Data modelled as large monolithic strings",
+                "detail":   "Almost all keys are Strings and the largest values are big serialised "
+                            "blobs. Reading one field means fetching and deserialising the whole "
+                            "value. Model records as Hash or JSON for field-level access "
+                            "(HGET / JSON.GET), and cap value size.",
+            })
+
+    # ── Memory fragmentation ──────────────────────────────────────────────────
+    for nd in all_node_data:
+        try:
+            frag = float(nd["info"].get("mem_fragmentation_ratio", 0))
+        except (ValueError, TypeError):
+            continue
+        if frag > 1.5:
+            recs.append({
+                "severity": "MEDIUM",
+                "title":    f"High memory fragmentation ratio ({frag})",
+                "detail":   "The allocator holds much more RSS than live data. Consider enabling "
+                            "activedefrag, running MEMORY PURGE, or (last resort) a rolling restart. "
+                            "Often follows a memory peak — check used_memory_peak.",
+            })
+            break
+
+    # ── Latency monitoring ────────────────────────────────────────────────────
+    for nd in all_node_data:
+        if str(nd["config"].get("latency-monitor-threshold", "0")) in ("0", "", "N/A"):
+            recs.append({
+                "severity": "LOW",
+                "title":    "Latency monitor disabled (latency-monitor-threshold=0)",
+                "detail":   "The built-in latency monitor is off, so LATENCY LATEST stays empty and "
+                            "spikes go unrecorded. Set latency-monitor-threshold (e.g. 100 ms).",
+            })
+            break
+    if any(nd.get("latency") for nd in all_node_data):
+        recs.append({
+            "severity": "MEDIUM",
+            "title":    "Latency spikes recorded (LATENCY LATEST)",
+            "detail":   "One or more nodes recorded latency events. Inspect LATENCY LATEST / "
+                        "LATENCY HISTORY per event type (fork, aof-write, expire-cycle, command) "
+                        "to find the cause.",
+        })
+
+    # ── Both AOF and RDB enabled ──────────────────────────────────────────────
+    for nd in all_node_data:
+        aof  = nd["config"].get("appendonly", "no")
+        save = nd["config"].get("save", "")
+        if aof == "yes" and save and save not in ('""', "", "N/A"):
+            recs.append({
+                "severity": "LOW",
+                "title":    "Both AOF and RDB persistence are enabled",
+                "detail":   "For a pure cache whose data is reconstructible, running both AOF "
+                            "(fsync) and RDB (fork) adds I/O and latency for little benefit. "
+                            "Consider RDB-only, or no persistence, if a cold cache is acceptable.",
+            })
+            break
+
+    # ── Hot key (heuristic from slow log; prefer HOTKEYS on Redis >= 8.6) ──────
+    slow_keys = []
+    for nd in all_node_data:
+        for e in nd.get("slowlog", []):
+            parts = str(e.get("command", "")).split()
+            if len(parts) >= 2:
+                slow_keys.append(parts[1])
+    if slow_keys:
+        top_key, top_count = Counter(slow_keys).most_common(1)[0]
+        if top_count >= 5 and top_count / len(slow_keys) >= 0.5:
+            recs.append({
+                "severity": "MEDIUM",
+                "title":    f"Hot key in slow log: {top_key} ({top_count} slow ops)",
+                "detail":   "A single key dominates the slow log — a hot key concentrating load on "
+                            "one shard's single thread. Split the value, add a client-side "
+                            "near-cache (CLIENT TRACKING), or shard it. On Redis >= 8.6 confirm "
+                            "with the HOTKEYS command.",
+            })
 
     return recs
 
@@ -956,21 +1118,34 @@ def section_slowlog(all_node_data: list) -> str:
 
 
 def section_keyspace(keyspace: dict, all_node_data: list) -> str:
+    def _db_keys(info):
+        db0 = info.get("db0")
+        if isinstance(db0, dict):       # redis-py parses "db0:keys=N,..." into a dict
+            return db0.get("keys", "—")
+        return db0 if db0 is not None else "—"
+
     dbsize_rows = "".join(
         f"<tr><td><code>{h(nd['label'])}</code></td>"
-        f"<td>{h(nd['info'].get('db0','—'))}</td>"
+        f"<td>{h(_db_keys(nd['info']))}</td>"
         f"<td>{h(nd['info'].get('expired_keys','?'))} expired</td></tr>"
         for nd in all_node_data
     )
     total_scanned = keyspace["total_scanned"]
     ttl   = keyspace["ttl_distribution"]
     types = keyspace["type_distribution"]
-    no_ttl_pct = round(ttl.get("no_ttl", 0) / max(total_scanned, 1) * 100)
+    den         = max(total_scanned, 1)
+    no_ttl      = ttl.get("no_ttl", 0)
+    has_ttl     = ttl.get("has_ttl", 0)
+    expired     = ttl.get("expired", 0)
+    no_ttl_pct  = round(no_ttl / den * 100)
+    has_ttl_pct = round(has_ttl / den * 100)
+    expired_pct = round(expired / den * 100)
 
     ttl_rows = f"""
-        <tr><td>No TTL (persistent)</td><td>{h(ttl.get('no_ttl',0))}</td>
+        <tr><td>No TTL (persistent)</td><td>{h(no_ttl)}</td>
             <td class="{'crit' if no_ttl_pct>70 else 'warn' if no_ttl_pct>40 else 'ok'}">{no_ttl_pct}%</td></tr>
-        <tr><td>Has TTL</td><td>{h(ttl.get('has_ttl',0))}</td><td>{100-no_ttl_pct}%</td></tr>
+        <tr><td>Has TTL</td><td>{h(has_ttl)}</td><td>{has_ttl_pct}%</td></tr>
+        <tr><td>Expired (vanished during scan)</td><td>{h(expired)}</td><td>{expired_pct}%</td></tr>
     """
     type_rows = "".join(
         f"<tr><td><code>{h(t)}</code></td><td>{h(c)}</td></tr>"
@@ -1134,6 +1309,16 @@ def build_html_report(all_node_data, conn_analysis, keyspace, stats, security, r
 # ---------------------------------------------------------------------------
 
 def main():
+    parser = argparse.ArgumentParser(description="Read-only audit of a Redis OSS cluster.")
+    parser.add_argument(
+        "--print-acl", nargs=2, metavar=("USER", "PASSWORD"),
+        help="Print the ACL SETUSER line for a read-only audit user, then exit.",
+    )
+    args = parser.parse_args()
+    if args.print_acl:
+        print(build_acl_setuser(args.print_acl[0], args.print_acl[1]))
+        return
+
     t_start = time.time()
     print("Redis Cluster Audit")
     print("=" * 50)
@@ -1151,6 +1336,10 @@ def main():
     print("  OK — user is read-only.\n")
 
     primaries  = rc.get_primaries()
+    if not primaries:
+        print("ERROR: No primary nodes found in the cluster — nothing to audit.")
+        print("Check cluster health (CLUSTER INFO / CLUSTER NODES) and connectivity.")
+        sys.exit(1)
     node_conns = [node_direct_connection(n) for n in primaries]
     print(f"Primaries found: {len(primaries)}")
     for n in primaries:
