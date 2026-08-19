@@ -1,0 +1,16 @@
+[project]
+name = "redis-cluster-audit"
+version = "0.1.0"
+description = "Read-only audit tool for Redis OSS clusters"
+requires-python = ">=3.10"
+classifiers = [
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+addopts = "-q"
