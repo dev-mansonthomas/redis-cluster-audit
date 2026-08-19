@@ -142,6 +142,16 @@ redis-cluster-audit/
 
 ---
 
+## Optional — precise hot-key detection (Redis ≥ 8.6)
+
+By default the audit is fully read-only and infers hot keys from the slow log. On Redis 8.6+ you can opt into **precise** per-key CPU/network tracking via the built-in `HOTKEYS` command:
+
+```bash
+python audit.py --hotkeys 10   # track for 10 seconds per node
+```
+
+> ⚠️ This mode is **invasive**: it runs `HOTKEYS START/STOP/RESET`, which mutates the server's tracking state, and it needs a user permitted to run `HOTKEYS` (grant `+HOTKEYS`). It is off by default — the standard audit never runs it. Nodes older than 8.6 are skipped automatically.
+
 ## Common findings
 
 **`timeout=0`** — idle connections never close. They accumulate until `maxclients` is reached, at which point Redis refuses new connections. Fix:

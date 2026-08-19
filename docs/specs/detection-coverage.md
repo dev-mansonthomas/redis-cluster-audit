@@ -186,3 +186,15 @@ Phase B — new detections (#3) — ✅ DONE (35 unit tests green)
 - Test harness: `pyproject.toml` (`pythonpath=["."]`, `requires-python>=3.10`),
   `requirements-dev.txt`, `tests/conftest.py` (`FakeNode`, `_FakePipeline`, `make_user`,
   `secure_config`).
+
+## 8. Follow-up shipped — HOTKEYS opt-in mode
+
+Branch `feat/hotkeys-detection` (off `main`): an **invasive, opt-in** hot-key mode.
+`audit.py --hotkeys N` runs `HOTKEYS START/GET/STOP/RESET` for N seconds per node on
+Redis ≥ 8.6, renders a Hot Keys report section (per-key CPU/network share), and adds
+recommendations when a key dominates (≥ 50%). The default audit stays read-only (slow-log
+heuristic). Key facts, verified against redis:8.6.5: `HOTKEYS` is a stateful tracking
+container command (not a read-only query — it mutates tracking state); needs a user granted
+`+HOTKEYS`; no LFU policy required; `GET` reply is `[{... 'by-cpu-time-us':[k,v,...],
+'by-net-bytes':[k,v,...] ...}]`. Version-gated via `version_at_least`. 17 unit tests +
+a live-8.6 integration check; nodes < 8.6 are skipped.
