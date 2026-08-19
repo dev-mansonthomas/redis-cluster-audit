@@ -1,6 +1,6 @@
 # Spec & Plan — Detection coverage + missing detections
 
-**Status:** Phase A complete (A1–A3, 24 unit tests green + Docker E2E); Phase B not started
+**Status:** Phase A & B complete (35 unit tests green + Docker E2E)
 **Branch:** `fix/code-review-fixes` (Phase 1 code-review fixes already implemented here; this
 is the next feature on top). Nothing committed yet.
 **Date:** 2026-08-19
@@ -161,16 +161,19 @@ Phase A — coverage of existing detections (#2) — ✅ DONE
   entries — ACL LOG aggregates identical failures, so a one-source brute-force previously
   slipped past. `audit.py:analyse_security`.
 
-Phase B — new detections (#3)
-- [ ] B1 — N1 noeviction on capped cache
-- [ ] B2 — N2 app connects as `default`
-- [ ] B3 — N3 per-IP connection concentration
-- [ ] B4 — N4 monolithic-String data model
-- [ ] B5 — N5 high fragmentation
-- [ ] B6 — N6 latency blindness / spikes
-- [ ] B7 — N7 AOF + RDB both (informational)
-- [ ] B8 — N8 hot-key heuristic (stretch)
-- [ ] B9 — fixture demonstrates B1–B8 + Docker E2E
+Phase B — new detections (#3) — ✅ DONE (35 unit tests green)
+- [x] B1 — N1 noeviction on capped cache (live-verified)
+- [x] B2 — N2 app connects as `default` (unit-only: local cluster is all-loopback)
+- [x] B3 — N3 per-IP connection concentration (unit-only: all-loopback)
+- [x] B4 — N4 monolithic-String data model (unit-only: fixture is ~86% string, under the 90% bar)
+- [x] B5 — N5 high fragmentation (live-verified, ratio 3.97)
+- [x] B6 — N6 latency monitor disabled / spikes (live-verified: monitor disabled)
+- [x] B7 — N7 AOF + RDB both (live-verified on node-3; needs unquoted `--save 3600 1`)
+- [x] B8 — N8 hot-key heuristic from slow log (live-verified: one key = 20/23 slow ops)
+- [x] B9 — fixture demonstrates N1/N5/N6/N7/N8 live + Docker E2E
+
+**New config knobs:** `CONN_PER_IP_WARN` (default 200); `collect_config` now also reads
+`latency-monitor-threshold`. `analyse_connections` returns `default_user_external`.
 
 ---
 
