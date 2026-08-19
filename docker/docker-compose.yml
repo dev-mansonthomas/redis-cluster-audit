@@ -81,4 +81,5 @@ services:
       --maxclients 10000
       --slowlog-log-slower-than 10000
       --slowlog-max-len 128
-      --save ""
+      --save 3600 1
+      --appendonly yes

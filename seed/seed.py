@@ -170,6 +170,25 @@ def trigger_slow_logs(node_connections):
     print("  Slow log entries created.")
 
 
+def trigger_hot_key(rc, node_connections):
+    """Hammer a single big key so it dominates the slow log (a hot-key signal)."""
+    print("  Triggering hot-key slow entries...")
+    originals = []
+    for r in node_connections:
+        originals.append((r, r.config_get("slowlog-log-slower-than")["slowlog-log-slower-than"]))
+        r.config_set("slowlog-log-slower-than", 0)
+    try:
+        for _ in range(20):
+            try:
+                rc.get("app:cache:bigobject:1mb")
+            except Exception:
+                pass
+    finally:
+        for r, original in originals:
+            r.config_set("slowlog-log-slower-than", original)
+    print("  Hot-key entries created.")
+
+
 def main():
     print("Connecting to local Redis cluster...")
     try:
@@ -190,6 +209,7 @@ def main():
     seed_normal_keys(rc)
     generate_hits_and_misses(rc)
     trigger_slow_logs(node_conns)
+    trigger_hot_key(rc, node_conns)
 
     # Show a quick summary
     total_keys = sum(r.dbsize() for r in node_conns)
