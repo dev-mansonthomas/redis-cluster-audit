@@ -14,9 +14,11 @@ What it creates:
 
 import os
 import sys
-import time
 import redis
 from redis.cluster import RedisCluster, ClusterNode
+from dotenv import load_dotenv
+
+load_dotenv()
 
 STARTUP_NODES = [
     ClusterNode("127.0.0.1", 6777),
@@ -34,16 +36,20 @@ DOCKER_ADDR_REMAP = {
 }
 
 PASSWORD = os.getenv("REDIS_PASSWORD") or None
+USERNAME = os.getenv("REDIS_USERNAME") or None
 
 
 def connect():
-    rc = RedisCluster(
+    kwargs = dict(
         startup_nodes=STARTUP_NODES,
         password=PASSWORD,
         decode_responses=True,
-        skip_full_coverage_check=True,
+        require_full_coverage=False,
         address_remap=lambda addr: DOCKER_ADDR_REMAP.get(addr, addr),
     )
+    if USERNAME:
+        kwargs["username"] = USERNAME
+    rc = RedisCluster(**kwargs)
     rc.ping()
     return rc
 
@@ -52,14 +58,16 @@ def get_direct_node_connections(rc):
     """Direct connections to each primary for CONFIG SET / admin commands."""
     nodes = []
     for node in rc.get_primaries():
-        r = redis.Redis(
+        kwargs = dict(
             host=node.host,
             port=node.port,
             password=PASSWORD,
             decode_responses=True,
             socket_timeout=5,
         )
-        nodes.append(r)
+        if USERNAME:
+            kwargs["username"] = USERNAME
+        nodes.append(redis.Redis(**kwargs))
     return nodes
 
 
@@ -125,27 +133,29 @@ def trigger_slow_logs(node_connections):
     for r in node_connections:
         original = r.config_get("slowlog-log-slower-than")["slowlog-log-slower-than"]
         r.config_set("slowlog-log-slower-than", 0)
-
-        # These are the exact commands that cause slowness in production:
-        # HGETALL on a large hash fetches all fields in one blocking call.
         try:
-            r.execute_command("HGETALL", "app:customer:BIG-HASH-2000")
-        except Exception:
-            pass
+            # These are the exact commands that cause slowness in production:
+            # HGETALL on a large hash fetches all fields in one blocking call.
+            try:
+                r.execute_command("HGETALL", "app:customer:BIG-HASH-2000")
+            except Exception:
+                pass
 
-        # SMEMBERS on a large set returns all members at once (O(N)).
-        try:
-            r.execute_command("SMEMBERS", "app:permissions:BIG-SET-2000")
-        except Exception:
-            pass
+            # SMEMBERS on a large set returns all members at once (O(N)).
+            try:
+                r.execute_command("SMEMBERS", "app:permissions:BIG-SET-2000")
+            except Exception:
+                pass
 
-        # LRANGE fetching an entire large list
-        try:
-            r.execute_command("LRANGE", "app:auditlog:BIG-LIST-5000", 0, -1)
-        except Exception:
-            pass
-
-        r.config_set("slowlog-log-slower-than", original)
+            # LRANGE fetching an entire large list
+            try:
+                r.execute_command("LRANGE", "app:auditlog:BIG-LIST-5000", 0, -1)
+            except Exception:
+                pass
+        finally:
+            # Always restore the threshold, even if a command above raised,
+            # so we never leave the node logging every command permanently.
+            r.config_set("slowlog-log-slower-than", original)
 
     print("  Slow log entries created.")
 
