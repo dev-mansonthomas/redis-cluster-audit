@@ -1,21 +1,37 @@
 #!/bin/bash
-# Local test runs against a self-contained Docker fixture.
+# INTERNAL TEST FIXTURE — not the audit entry point.
+# Spins up a throwaway Redis cluster in Docker, seeds bad-practice data, and
+# runs the audit against it to exercise the tool end to end.
 #
-#   bash run.sh                 Default: Redis 6.2.20 cluster, read-only audit.
-#   bash run.sh --hotkeys [N]   Redis 8.10 cluster; generate load on one key,
-#                               then run the INVASIVE HOTKEYS audit for N seconds
-#                               (default 10) so the report's Hot Keys section is
-#                               populated. Requires Redis >= 8.6 (this fixture).
+# For auditing a REAL server use the root scripts instead:
+#   ./run_audit.sh   ./run_audit_hotkeys.sh   ./create_audit_user.sh
 #
-# The fixtures use their own fixed credentials and do NOT read .env (that file
-# is only for auditing real, external servers). Set PYTHON=/path/to/python to
-# use a specific interpreter (e.g. a venv).
+#   bash local-test/run.sh                 Redis 6.2.20 cluster, read-only audit.
+#   bash local-test/run.sh --hotkeys [N]   Redis 8.10 cluster; generate load on one
+#                                          key, then run the INVASIVE HOTKEYS audit
+#                                          for N seconds (default 10).
 #
-# Usage: bash run.sh [--hotkeys [SECONDS]]
+# The fixtures use fixed test credentials and do NOT read .env. Set PYTHON to
+# override the interpreter; otherwise a local .venv is created.
+#
+# Usage: bash local-test/run.sh [--hotkeys [SECONDS]]
 
 set -e
 
-PY="${PYTHON:-python3}"
+# Operate from the repo root regardless of where this is called from.
+cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# Interpreter: honour $PYTHON, else use/create a local .venv.
+if [ -n "${PYTHON:-}" ]; then
+    PY="$PYTHON"
+else
+    if [ ! -x .venv/bin/python ]; then
+        echo "Creating .venv..."
+        python3 -m venv .venv
+    fi
+    PY=".venv/bin/python"
+fi
+
 AUDIT_USER="audit_ro"
 AUDIT_PASS="audit123"
 
@@ -38,7 +54,7 @@ DOCKER_ENV=(
 )
 
 echo "========================================"
-echo " Redis Cluster Audit — Local Test Run"
+echo " Redis Cluster Audit — Local Test Fixture"
 echo " Mode: $MODE  ($COMPOSE_FILE)"
 echo "========================================"
 echo ""
