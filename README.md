@@ -21,6 +21,9 @@ Read-only by design: it requires a read-only user, and the only write it attempt
 | **Key Space** | Key count, TTL distribution, type distribution, keys expiring soon |
 | **Big Keys** | Top N keys by memory (SCAN + MEMORY USAGE — never KEYS *) |
 | **Security Audit** | ACL users (over-privileged, nopass), network exposure, TLS, ACL LOG |
+| **Hot Keys** *(opt-in `--hotkeys`)* | Per-key CPU / network share via `HOTKEYS` tracking (Redis ≥ 8.6) |
+
+Recommendations now also cover: `noeviction` on a capped cache, an app connecting as the `default` user, connection concentration on one IP, monolithic-String data models, high fragmentation, latency-monitor/spikes, AOF+RDB both enabled, and hot keys.
 
 ---
 
@@ -29,8 +32,8 @@ Read-only by design: it requires a read-only user, and the only write it attempt
 | Tool | Min version |
 |---|---|
 | Python | 3.10+ |
-| Docker Desktop | 4.x (local testing only) |
-| redis-cli | 6.x (local cluster init only) |
+| Docker Desktop | 4.x (local test fixture only) |
+| redis-cli | 6.x (cluster init + `create_audit_user.sh`) |
 
 ---
 
@@ -144,8 +147,10 @@ redis-cluster-audit/
 | `REDIS_PASSWORD` | — | Password (leave empty if none) |
 | `BIG_KEY_TOP_N` | 30 | Number of big keys in the report |
 | `SCAN_SAMPLE_SIZE` | 5000 | Keys scanned per shard for TTL/type analysis |
+| `SCAN_MEMORY_SAMPLES` | 5 | `MEMORY USAGE` sampling depth (0 = exact O(N) walk — avoid on prod) |
 | `SLOWLOG_MAX_ENTRIES` | 25 | Slow log entries fetched per node |
-| `REDIS_DOCKER_REMAP` | false | Enable only for local Docker testing on Mac |
+| `CONN_PER_IP_WARN` | 200 | Warn when one source IP holds more than this many connections |
+| `REDIS_DOCKER_REMAP` | false | Enable only for the local Docker fixture on Mac |
 
 ---
 
@@ -176,6 +181,20 @@ CONFIG SET tcp-keepalive 60
 **`maxmemory=0`** — no memory cap. A memory leak or data burst will OOM-kill the process.
 
 **Default user `nopass`** — any client can connect without authentication.
+
+---
+
+## Troubleshooting
+
+| Symptom | Fix |
+|---|---|
+| `ERROR: Cannot connect` | Check `REDIS_HOST_*`/`REDIS_PORT_*` and that the audit user exists on every node (`./create_audit_user.sh`). For the **local fixture** only, `REDIS_DOCKER_REMAP=true` is required. |
+| `STOP — the Redis user has WRITE access` | You pointed the audit at a write-capable user. Use a read-only user (`./create_audit_user.sh`). The canary write is removed immediately. |
+| `pip: externally-managed-environment` (macOS/Homebrew) | Use the entry scripts (they create a `.venv`), or install inside a venv: `python3 -m venv .venv && source .venv/bin/activate`. |
+| `Cannot connect to the Docker daemon` | Start Docker Desktop before `local-test/run.sh`. |
+| `redis-cli: command not found` | `brew install redis` (needed for the local fixture and `create_audit_user.sh`). |
+| Port `6777/6778/6779` already in use | A previous fixture is still up: `docker compose -f docker/docker-compose.yml down && docker compose -f docker/docker-compose-8.yml down`. |
+| `--hotkeys` shows "Redis < 8.6 — skipped" | HOTKEYS needs Redis ≥ 8.6; the default local fixture is 6.2.20 — use `local-test/run.sh --hotkeys` (Redis 8.10) or a real 8.6+ server. |
 
 ---
 
