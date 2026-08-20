@@ -261,6 +261,74 @@ def collect_latency(r: redis.Redis) -> list:
         return []
 
 
+HOTKEYS_MIN_VERSION = (8, 6)  # HOTKEYS command introduced in Redis 8.6
+
+
+def version_at_least(version_str, minimum) -> bool:
+    """True if a dotted version string (e.g. '8.6.5') is >= the minimum tuple."""
+    try:
+        nums = [int(x) for x in str(version_str).split(".")]
+    except (ValueError, TypeError):
+        return False
+    nums += [0] * (len(minimum) - len(nums))
+    return tuple(nums[:len(minimum)]) >= tuple(minimum)
+
+
+def _parse_hotkeys_get(reply):
+    """
+    Parse a HOTKEYS GET reply into {by_cpu, by_net, total_cpu, total_net,
+    duration_ms}, or None. Handles RESP2 (flat [k, v, ...] lists) and RESP3
+    (dicts) — verified against Redis 8.6.5.
+    """
+    if not reply:
+        return None
+    data = reply[0] if isinstance(reply, list) and reply else reply
+    if not isinstance(data, dict):
+        return None
+
+    def _to_dict(flat):
+        if isinstance(flat, dict):
+            return flat
+        if isinstance(flat, (list, tuple)):
+            return {flat[i]: flat[i + 1] for i in range(0, len(flat) - 1, 2)}
+        return {}
+
+    return {
+        "by_cpu":      _to_dict(data.get("by-cpu-time-us", [])),
+        "by_net":      _to_dict(data.get("by-net-bytes", [])),
+        "total_cpu":   data.get("all-commands-all-slots-us", 0) or 0,
+        "total_net":   data.get("total-net-bytes", 0) or 0,
+        "duration_ms": data.get("collection-duration-ms", 0) or 0,
+    }
+
+
+def collect_hotkeys(r: redis.Redis, duration_s: int, top_k: int = 10):
+    """
+    INVASIVE (opt-in): run server-side HOTKEYS tracking for duration_s seconds,
+    then fetch and release it. Requires Redis >= 8.6 and a user permitted to run
+    HOTKEYS. Returns parsed results, or None if unavailable / not permitted.
+    """
+    try:
+        r.execute_command("HOTKEYS", "START", "METRICS", "2", "CPU", "NET",
+                          "COUNT", str(top_k), "DURATION", str(duration_s))
+    except (redis.exceptions.ResponseError, redis.exceptions.NoPermissionError) as e:
+        print(f"    HOTKEYS unavailable on this node ({e}); grant +HOTKEYS or use Redis >= 8.6.")
+        return None
+
+    time.sleep(duration_s + 1)   # let the tracking window elapse (auto-stops at DURATION)
+    try:
+        reply = r.execute_command("HOTKEYS", "GET")
+    except (redis.exceptions.ResponseError, redis.exceptions.NoPermissionError):
+        reply = None
+    finally:
+        for sub in ("STOP", "RESET"):   # release tracking resources, best-effort
+            try:
+                r.execute_command("HOTKEYS", sub)
+            except redis.exceptions.ResponseError:
+                pass
+    return _parse_hotkeys_get(reply)
+
+
 def collect_acl_data(r: redis.Redis) -> dict:
     """Fetch ACL users list and recent ACL log entries."""
     acl_list = []
@@ -837,10 +905,41 @@ def generate_recommendations(all_node_data: list, conn_analysis: dict,
                 "title":    f"Hot key in slow log: {top_key} ({top_count} slow ops)",
                 "detail":   "A single key dominates the slow log — a hot key concentrating load on "
                             "one shard's single thread. Split the value, add a client-side "
-                            "near-cache (CLIENT TRACKING), or shard it. On Redis >= 8.6 confirm "
-                            "with the HOTKEYS command.",
+                            "near-cache (CLIENT TRACKING), or shard it. On Redis >= 8.6, re-run "
+                            "with --hotkeys N for precise per-key CPU/network metrics.",
             })
 
+    return recs
+
+
+HOTKEY_SHARE_WARN = 0.5  # a key taking >= this share of a shard's CPU or net is "hot"
+
+
+def analyse_hotkeys(all_node_data: list) -> list:
+    """Recommendations from HOTKEYS tracking data (present only with --hotkeys)."""
+    recs = []
+    for nd in all_node_data:
+        hk = nd.get("hotkeys")
+        if not hk:
+            continue
+        for metric_key, total_key, unit in (
+            ("by_cpu", "total_cpu", "CPU time"),
+            ("by_net", "total_net", "network bytes"),
+        ):
+            metric = hk.get(metric_key) or {}
+            total = hk.get(total_key) or 0
+            if not metric or total <= 0:
+                continue
+            top_key = max(metric, key=lambda k: metric[k])
+            share = metric[top_key] / total
+            if share >= HOTKEY_SHARE_WARN:
+                recs.append({
+                    "severity": "MEDIUM",
+                    "title":    f"Hot key {top_key} — {round(share * 100)}% of {unit} on {nd['label']}",
+                    "detail":   f"HOTKEYS tracking shows one key dominating this shard's {unit}, "
+                                "concentrating load on a single thread. Split the value, add a "
+                                "client-side near-cache (CLIENT TRACKING), or shard the key.",
+                })
     return recs
 
 
@@ -1268,6 +1367,35 @@ def section_security(security: dict) -> str:
     return f"<h2>Security Audit</h2>{findings_table}{acl_table}{acl_log_section}"
 
 
+def section_hotkeys(all_node_data: list) -> str:
+    nodes_with = [nd for nd in all_node_data if nd.get("hotkeys")]
+    if not nodes_with:
+        return ""   # only shown when the invasive --hotkeys mode was used
+
+    def _rows(metric, total):
+        rows = ""
+        for k, v in sorted(metric.items(), key=lambda x: x[1], reverse=True):
+            pct = f"{v / total * 100:.1f}%" if total else "—"
+            rows += f"<tr><td style='word-break:break-all'><code>{h(k)}</code></td><td>{pct}</td></tr>"
+        return rows or "<tr><td colspan='2'>no data</td></tr>"
+
+    blocks = ""
+    for nd in nodes_with:
+        hk = nd["hotkeys"]
+        blocks += f"""
+        <h3><code>{h(nd['label'])}</code></h3>
+        <div class="grid">
+            <div class="card"><h3>Top keys by CPU time</h3>
+                <table><tr><th>Key</th><th>Share</th></tr>{_rows(hk.get('by_cpu') or {}, hk.get('total_cpu') or 0)}</table></div>
+            <div class="card"><h3>Top keys by network bytes</h3>
+                <table><tr><th>Key</th><th>Share</th></tr>{_rows(hk.get('by_net') or {}, hk.get('total_net') or 0)}</table></div>
+        </div>"""
+    return f"""
+    <h2>Hot Keys <small>(HOTKEYS tracking — invasive, opt-in)</small></h2>
+    <p>Server-side per-key CPU / network share during the tracking window (Redis &ge; 8.6).</p>
+    {blocks}"""
+
+
 def build_html_report(all_node_data, conn_analysis, keyspace, stats, security, recs, duration_s) -> str:
     generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     nodes_str    = ", ".join(nd["label"] for nd in all_node_data)
@@ -1298,6 +1426,7 @@ def build_html_report(all_node_data, conn_analysis, keyspace, stats, security, r
   {section_slowlog(all_node_data)}
   {section_keyspace(keyspace, all_node_data)}
   {section_big_keys(keyspace)}
+  {section_hotkeys(all_node_data)}
   {section_security(security)}
 </div>
 </body>
@@ -1313,6 +1442,11 @@ def main():
     parser.add_argument(
         "--print-acl", nargs=2, metavar=("USER", "PASSWORD"),
         help="Print the ACL SETUSER line for a read-only audit user, then exit.",
+    )
+    parser.add_argument(
+        "--hotkeys", type=int, metavar="SECONDS",
+        help="INVASIVE (opt-in): run HOTKEYS tracking for SECONDS per node to find hot keys "
+             "(Redis >= 8.6; needs a user permitted to run HOTKEYS). Mutates server tracking state.",
     )
     args = parser.parse_args()
     if args.print_acl:
@@ -1361,6 +1495,16 @@ def main():
             "acl_data":      collect_acl_data(r),
         })
 
+    if args.hotkeys:
+        print(f"\n[INVASIVE] HOTKEYS tracking for {args.hotkeys}s per node (Redis >= 8.6)...")
+        for nd, r in zip(all_node_data, node_conns):
+            version = nd["info"].get("redis_version", "0")
+            if not version_at_least(version, HOTKEYS_MIN_VERSION):
+                print(f"    {nd['label']}: Redis {version} < 8.6 — skipped")
+                continue
+            print(f"    {nd['label']}: tracking {args.hotkeys}s...")
+            nd["hotkeys"] = collect_hotkeys(r, args.hotkeys)
+
     print("\nAnalysing connections...")
     client_lists  = {nd["label"]: nd["client_list"] for nd in all_node_data}
     conn_analysis = analyse_connections(client_lists)
@@ -1377,6 +1521,7 @@ def main():
     print(f"  Security findings: {len(security['findings'])}")
 
     recs     = generate_recommendations(all_node_data, conn_analysis, keyspace, security, stats)
+    recs    += analyse_hotkeys(all_node_data)
     duration = time.time() - t_start
 
     print(f"\nGenerating HTML report...")

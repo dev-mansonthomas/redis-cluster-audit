@@ -1,0 +1,84 @@
+# 3-shard Redis 8.10 cluster for exercising the HOTKEYS opt-in mode locally.
+#
+# Same ports / IPs / subnet / container names as docker-compose.yml (the 6.2
+# fixture), so init-cluster.sh, the address remap and seed all work unchanged.
+# Only one of the two clusters can run at a time — run.sh tears the other down
+# first. HOTKEYS requires Redis >= 8.6.
+#
+#   redis-node-1  172.29.0.10:6777  ->  127.0.0.1:6777
+#   redis-node-2  172.29.0.11:6778  ->  127.0.0.1:6778
+#   redis-node-3  172.29.0.12:6779  ->  127.0.0.1:6779
+
+networks:
+  redis-cluster:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.29.0.0/16
+
+services:
+  redis-node-1:
+    image: redis:8.10
+    container_name: redis-node-1
+    networks:
+      redis-cluster:
+        ipv4_address: 172.29.0.10
+    ports:
+      - "6777:6777"
+    command: >
+      redis-server
+      --port 6777
+      --cluster-enabled yes
+      --cluster-config-file nodes.conf
+      --cluster-node-timeout 5000
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+      --timeout 300
+      --maxclients 10000
+      --slowlog-log-slower-than 10000
+      --slowlog-max-len 128
+      --save ""
+
+  redis-node-2:
+    image: redis:8.10
+    container_name: redis-node-2
+    networks:
+      redis-cluster:
+        ipv4_address: 172.29.0.11
+    ports:
+      - "6778:6778"
+    command: >
+      redis-server
+      --port 6778
+      --cluster-enabled yes
+      --cluster-config-file nodes.conf
+      --cluster-node-timeout 5000
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+      --timeout 300
+      --maxclients 10000
+      --slowlog-log-slower-than 10000
+      --slowlog-max-len 128
+      --save ""
+
+  redis-node-3:
+    image: redis:8.10
+    container_name: redis-node-3
+    networks:
+      redis-cluster:
+        ipv4_address: 172.29.0.12
+    ports:
+      - "6779:6779"
+    command: >
+      redis-server
+      --port 6779
+      --cluster-enabled yes
+      --cluster-config-file nodes.conf
+      --cluster-node-timeout 5000
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+      --timeout 300
+      --maxclients 10000
+      --slowlog-log-slower-than 10000
+      --slowlog-max-len 128
+      --save ""

@@ -21,6 +21,9 @@ Read-only by design: it requires a read-only user, and the only write it attempt
 | **Key Space** | Key count, TTL distribution, type distribution, keys expiring soon |
 | **Big Keys** | Top N keys by memory (SCAN + MEMORY USAGE — never KEYS *) |
 | **Security Audit** | ACL users (over-privileged, nopass), network exposure, TLS, ACL LOG |
+| **Hot Keys** *(opt-in `--hotkeys`)* | Per-key CPU / network share via `HOTKEYS` tracking (Redis ≥ 8.6) |
+
+Recommendations now also cover: `noeviction` on a capped cache, an app connecting as the `default` user, connection concentration on one IP, monolithic-String data models, high fragmentation, latency-monitor/spikes, AOF+RDB both enabled, and hot keys.
 
 ---
 
@@ -29,62 +32,62 @@ Read-only by design: it requires a read-only user, and the only write it attempt
 | Tool | Min version |
 |---|---|
 | Python | 3.10+ |
-| Docker Desktop | 4.x (local testing only) |
-| redis-cli | 6.x (local cluster init only) |
+| Docker Desktop | 4.x (local test fixture only) |
+| redis-cli | 6.x (cluster init + `create_audit_user.sh`) |
 
 ---
 
 ## Installation
 
+The entry scripts (`run_audit.sh`, `create_audit_user.sh`, `local-test/run.sh`) create a local `.venv` and install dependencies automatically on first run. To install manually (e.g. to run `python audit.py` directly):
+
+```bash
+python3 -m venv .venv && source .venv/bin/activate
+```
 ```bash
 pip install -r requirements.txt
 ```
 
 ---
 
-## Quick start — local Docker
+## Quick start — local Docker (test fixture)
 
-Starts a 3-shard Redis 6.2.20 cluster, seeds test data, and runs the audit in one command:
+To exercise the tool against a throwaway cluster, in one command:
 
 ```bash
-bash run.sh
+bash local-test/run.sh
 ```
 
-`run.sh` is self-contained: it installs dependencies, starts the Docker cluster, provisions a read-only user, seeds test data, and runs the audit. It uses fixed test credentials and does **not** read `.env` (that file is only for auditing real, external servers).
+This is the internal **test fixture**, not the audit entry point: it creates a `.venv`, starts a 3-shard Redis 6.2.20 cluster, provisions a read-only user, seeds bad-practice data, and runs the audit. It uses fixed test credentials and does **not** read `.env`. To audit a real server, use the root scripts below.
 
 ---
 
-## Production usage
+## Production usage — audit a real server
 
-### Step 1 — Create a read-only audit user on each Redis node
+Three root scripts handle everything (each creates a `.venv` and installs deps on first run):
 
-Connect with an admin account and run:
+| Script | Purpose |
+|---|---|
+| `./create_audit_user.sh` | Provision the read-only audit user on every node (prompts for the password) |
+| `./run_audit.sh` | Run the read-only audit → `report.html` |
+| `./run_audit_hotkeys.sh [N]` | Read-only audit **plus** invasive HOTKEYS tracking (Redis ≥ 8.6) |
 
-```
-ACL SETUSER audit_ro on >YOUR_PASSWORD ~* &* nocommands \
-  +INFO +CONFIG|GET \
-  +SLOWLOG|GET +SLOWLOG|LEN \
-  +MEMORY|USAGE +MEMORY|DOCTOR +MEMORY|STATS \
-  +CLIENT|LIST \
-  +DBSIZE \
-  +CLUSTER|INFO +CLUSTER|NODES +CLUSTER|SLOTS +CLUSTER|SHARDS +CLUSTER|KEYSLOT +CLUSTER|MYID \
-  +SCAN +TYPE +TTL +OBJECT|ENCODING +OBJECT|IDLETIME \
-  +ACL|LIST +ACL|USERS +ACL|CAT +ACL|LOG \
-  +LATENCY|LATEST +LATENCY|HISTORY \
-  +PING +READONLY +COMMAND
-```
-
-> Generate this exact line for any username/password with:
-> ```bash
-> python audit.py --print-acl audit_ro YOUR_PASSWORD
-> ```
-> The script performs a write permission check at startup and exits with the ACL command above if the user has write access.
-
-### Step 2 — Configure `.env`
+### Step 1 — Point `.env` at your nodes, then create the user
 
 ```bash
-cp .env.example .env
+cp .env.example .env      # set REDIS_HOST_*/PORT_* (the node addresses)
 ```
+```bash
+./create_audit_user.sh    # prompts for the new password + admin credentials
+```
+
+`create_audit_user.sh` provisions the user on every cluster node (discovered via `CLUSTER NODES`), using `audit.py --print-acl` as the single source of truth for the grants. To do it by hand instead, run that command and apply the printed `ACL SETUSER …` on each node:
+
+```bash
+python audit.py --print-acl audit_ro YOUR_PASSWORD
+```
+
+### Step 2 — Finish configuring `.env`
 
 ```env
 REDIS_HOST_1=<node-1-ip>
@@ -104,7 +107,7 @@ REDIS_DOCKER_REMAP=false
 ### Step 3 — Run
 
 ```bash
-python audit.py
+./run_audit.sh
 # → report.html
 ```
 
@@ -114,15 +117,22 @@ python audit.py
 
 ```
 redis-cluster-audit/
-├── audit.py              ← main audit script → report.html
-├── run.sh                ← full local test (Docker + seed + audit)
+├── audit.py                 ← the audit (produces report.html)
+├── run_audit.sh             ← entry point: read-only audit
+├── run_audit_hotkeys.sh     ← entry point: audit + invasive HOTKEYS (Redis ≥ 8.6)
+├── create_audit_user.sh     ← provision the read-only user on every node
 ├── requirements.txt
-├── .env.example          ← production config template
+├── .env.example             ← production config template
+├── tests/                   ← unit tests (pytest, no server needed)
+├── local-test/
+│   └── run.sh               ← Docker integration fixture (NOT the entry point)
 ├── docker/
-│   ├── docker-compose.yml   ← 3-node Redis 6.2.20 cluster
+│   ├── docker-compose.yml     ← 3-node Redis 6.2.20 cluster (default fixture)
+│   ├── docker-compose-8.yml   ← 3-node Redis 8.10 cluster (--hotkeys fixture)
 │   └── init-cluster.sh
 └── seed/
-    └── seed.py              ← loads test data (big keys, slow logs, TTL mix)
+    ├── seed.py                ← loads test data (big keys, slow logs, TTL mix)
+    └── hotkey_load.py         ← concentrated load on one key (for --hotkeys)
 ```
 
 ---
@@ -137,10 +147,28 @@ redis-cluster-audit/
 | `REDIS_PASSWORD` | — | Password (leave empty if none) |
 | `BIG_KEY_TOP_N` | 30 | Number of big keys in the report |
 | `SCAN_SAMPLE_SIZE` | 5000 | Keys scanned per shard for TTL/type analysis |
+| `SCAN_MEMORY_SAMPLES` | 5 | `MEMORY USAGE` sampling depth (0 = exact O(N) walk — avoid on prod) |
 | `SLOWLOG_MAX_ENTRIES` | 25 | Slow log entries fetched per node |
-| `REDIS_DOCKER_REMAP` | false | Enable only for local Docker testing on Mac |
+| `CONN_PER_IP_WARN` | 200 | Warn when one source IP holds more than this many connections |
+| `REDIS_DOCKER_REMAP` | false | Enable only for the local Docker fixture on Mac |
 
 ---
+
+## Optional — precise hot-key detection (Redis ≥ 8.6)
+
+By default the audit is fully read-only and infers hot keys from the slow log. On Redis 8.6+ you can opt into **precise** per-key CPU/network tracking via the built-in `HOTKEYS` command:
+
+```bash
+./run_audit_hotkeys.sh 10   # track for 10 seconds per node
+```
+
+> ⚠️ This mode is **invasive**: it runs `HOTKEYS START/STOP/RESET`, which mutates the server's tracking state, and it needs a user permitted to run `HOTKEYS` (grant `+HOTKEYS` — `create_audit_user.sh` offers to do this). It is off by default — the standard audit never runs it. Nodes older than 8.6 are skipped automatically.
+
+**Try it locally** against a throwaway Redis 8.10 cluster — this spins up the fixture, generates load on one key, then runs the HOTKEYS audit so the report's *Hot Keys* section is populated:
+
+```bash
+bash local-test/run.sh --hotkeys 10   # 10 = tracking seconds (default 10)
+```
 
 ## Common findings
 
@@ -153,6 +181,20 @@ CONFIG SET tcp-keepalive 60
 **`maxmemory=0`** — no memory cap. A memory leak or data burst will OOM-kill the process.
 
 **Default user `nopass`** — any client can connect without authentication.
+
+---
+
+## Troubleshooting
+
+| Symptom | Fix |
+|---|---|
+| `ERROR: Cannot connect` | Check `REDIS_HOST_*`/`REDIS_PORT_*` and that the audit user exists on every node (`./create_audit_user.sh`). For the **local fixture** only, `REDIS_DOCKER_REMAP=true` is required. |
+| `STOP — the Redis user has WRITE access` | You pointed the audit at a write-capable user. Use a read-only user (`./create_audit_user.sh`). The canary write is removed immediately. |
+| `pip: externally-managed-environment` (macOS/Homebrew) | Use the entry scripts (they create a `.venv`), or install inside a venv: `python3 -m venv .venv && source .venv/bin/activate`. |
+| `Cannot connect to the Docker daemon` | Start Docker Desktop before `local-test/run.sh`. |
+| `redis-cli: command not found` | `brew install redis` (needed for the local fixture and `create_audit_user.sh`). |
+| Port `6777/6778/6779` already in use | A previous fixture is still up: `docker compose -f docker/docker-compose.yml down && docker compose -f docker/docker-compose-8.yml down`. |
+| `--hotkeys` shows "Redis < 8.6 — skipped" | HOTKEYS needs Redis ≥ 8.6; the default local fixture is 6.2.20 — use `local-test/run.sh --hotkeys` (Redis 8.10) or a real 8.6+ server. |
 
 ---
 
