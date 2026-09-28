@@ -49,4 +49,8 @@ fi
 
 echo "Auditing ${REDIS_HOST_1}:${REDIS_PORT_1:-6379} as '${REDIS_USERNAME:-default}'..."
 "$PY" audit.py "$@"
-echo "Report: $(pwd)/report.html"
+# Only advertise a report when the audit actually wrote one — skip the info-only / early-exit modes.
+case " $* " in
+    *" --print-acl "*|*" --print-acl-grants "*|*" -h "*|*" --help "*) : ;;
+    *) echo "Report: $(pwd)/report.html" ;;
+esac

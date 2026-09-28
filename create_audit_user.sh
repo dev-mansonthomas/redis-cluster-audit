@@ -63,7 +63,12 @@ CLUSTER_OUT="$(redis-cli -h "$SEED_HOST" -p "$SEED_PORT" "${AUTH[@]}" CLUSTER NO
 if [ -n "$CLUSTER_OUT" ]; then
     while IFS= read -r line; do
         addr="$(printf '%s' "$line" | awk '{print $2}' | cut -d'@' -f1)"
-        if [ -n "$addr" ]; then NODES+=("$addr"); fi
+        flags="$(printf '%s' "$line" | awk '{print $3}')"
+        # Skip nodes that aren't reachable targets: failed / no-address / still-handshaking, or a
+        # bogus ':0' / empty address — otherwise `redis-cli -h '' -p 0` fails the whole run.
+        case "$flags" in *fail*|*noaddr*|*handshake*) continue ;; esac
+        h="${addr%:*}"; p="${addr##*:}"
+        if [ -n "$h" ] && [ -n "$p" ] && [ "$p" != 0 ]; then NODES+=("$addr"); fi
     done <<< "$CLUSTER_OUT"
 fi
 if [ ${#NODES[@]} -eq 0 ]; then
@@ -77,14 +82,20 @@ if [ ${#NODES[@]} -eq 0 ]; then
 fi
 echo "Target nodes: ${NODES[*]}"
 
-# ── Create the user on each node (grants from audit.py --print-acl) ───────────
-ACL_CMD="$("$PY" audit.py --print-acl "$AUDIT_USER" "$AUDIT_PASS")"
+# ── Create the user on each node ──────────────────────────────────────────────
+# Grants come from audit.py (single source of truth) as password-free tokens; we apply the ACL via
+# redis-cli ARGV with the password as its OWN token — so a password containing spaces or shell/
+# redis-cli-special characters is never split or misparsed. We also CHECK the reply is OK, because
+# redis-cli reading a command from a pipe returns exit 0 even when the reply is a Redis error.
+read -r -a GRANTS <<< "$("$PY" audit.py --print-acl-grants)"
 
 FAILED=0
 for node in "${NODES[@]}"; do
     host="${node%:*}"; port="${node##*:}"
     printf '  %s ... ' "$node"
-    if echo "$ACL_CMD" | redis-cli -h "$host" -p "$port" "${AUTH[@]}" >/dev/null 2>&1; then
+    reply="$(redis-cli -h "$host" -p "$port" "${AUTH[@]}" \
+                 ACL SETUSER "$AUDIT_USER" on ">$AUDIT_PASS" "${GRANTS[@]}" 2>&1)"
+    if [ "$reply" = "OK" ]; then
         case "$GRANT_HK" in
             [Yy]*) redis-cli -h "$host" -p "$port" "${AUTH[@]}" \
                        ACL SETUSER "$AUDIT_USER" +HOTKEYS >/dev/null 2>&1 || true ;;
@@ -92,7 +103,7 @@ for node in "${NODES[@]}"; do
         redis-cli -h "$host" -p "$port" "${AUTH[@]}" ACL SAVE >/dev/null 2>&1 || true
         echo "OK"
     else
-        echo "FAILED (check admin credentials / connectivity)"
+        echo "FAILED (${reply:-check admin credentials / connectivity})"
         FAILED=1
     fi
 done

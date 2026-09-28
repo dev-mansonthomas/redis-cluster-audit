@@ -94,10 +94,15 @@ READONLY_ACL_COMMANDS = [
 ]
 
 
+def build_acl_grants() -> str:
+    """The ACL rule tokens that follow `on >PASSWORD` — no password, so they are safe to pass as
+    redis-cli argv (create_audit_user.sh applies them that way to avoid quoting/splitting bugs)."""
+    return "~* &* nocommands " + " ".join(READONLY_ACL_COMMANDS)
+
+
 def build_acl_setuser(user: str, password: str) -> str:
     """Build the `ACL SETUSER` line that grants exactly the read-only audit grants."""
-    grants = " ".join(READONLY_ACL_COMMANDS)
-    return f"ACL SETUSER {user} on >{password} ~* &* nocommands {grants}"
+    return f"ACL SETUSER {user} on >{password} {build_acl_grants()}"
 
 
 READONLY_ACL_SCRIPT = (
@@ -265,10 +270,15 @@ HOTKEYS_MIN_VERSION = (8, 6)  # HOTKEYS command introduced in Redis 8.6
 
 
 def version_at_least(version_str, minimum) -> bool:
-    """True if a dotted version string (e.g. '8.6.5') is >= the minimum tuple."""
-    try:
-        nums = [int(x) for x in str(version_str).split(".")]
-    except (ValueError, TypeError):
+    """True if a dotted version string is >= the minimum tuple. Tolerates a non-numeric suffix on a
+    component (e.g. '8.6.0-rc1' or a vendor build) by taking that component's leading digits."""
+    nums = []
+    for part in str(version_str).split("."):
+        lead = part[:len(part) - len(part.lstrip("0123456789"))]
+        if not lead:
+            break
+        nums.append(int(lead))
+    if not nums:
         return False
     nums += [0] * (len(minimum) - len(nums))
     return tuple(nums[:len(minimum)]) >= tuple(minimum)
@@ -1437,6 +1447,14 @@ def build_html_report(all_node_data, conn_analysis, keyspace, stats, security, r
 # Main
 # ---------------------------------------------------------------------------
 
+def _positive_int(s):
+    """argparse type: a strictly positive integer (rejects 0 and negatives with a clear error)."""
+    v = int(s)
+    if v <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer (seconds)")
+    return v
+
+
 def main():
     parser = argparse.ArgumentParser(description="Read-only audit of a Redis OSS cluster.")
     parser.add_argument(
@@ -1444,13 +1462,21 @@ def main():
         help="Print the ACL SETUSER line for a read-only audit user, then exit.",
     )
     parser.add_argument(
-        "--hotkeys", type=int, metavar="SECONDS",
-        help="INVASIVE (opt-in): run HOTKEYS tracking for SECONDS per node to find hot keys "
-             "(Redis >= 8.6; needs a user permitted to run HOTKEYS). Mutates server tracking state.",
+        "--print-acl-grants", action="store_true",
+        help="Print just the ACL rule tokens (no password) for scripted provisioning, then exit.",
+    )
+    parser.add_argument(
+        "--hotkeys", type=_positive_int, metavar="SECONDS",
+        help="INVASIVE (opt-in): run HOTKEYS tracking for SECONDS (a positive integer) per node to "
+             "find hot keys (Redis >= 8.6; needs a user permitted to run HOTKEYS). Mutates server "
+             "tracking state.",
     )
     args = parser.parse_args()
     if args.print_acl:
         print(build_acl_setuser(args.print_acl[0], args.print_acl[1]))
+        return
+    if args.print_acl_grants:
+        print(build_acl_grants())
         return
 
     t_start = time.time()
@@ -1495,7 +1521,7 @@ def main():
             "acl_data":      collect_acl_data(r),
         })
 
-    if args.hotkeys:
+    if args.hotkeys is not None:
         print(f"\n[INVASIVE] HOTKEYS tracking for {args.hotkeys}s per node (Redis >= 8.6)...")
         for nd, r in zip(all_node_data, node_conns):
             version = nd["info"].get("redis_version", "0")
