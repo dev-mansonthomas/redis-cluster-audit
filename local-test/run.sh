@@ -42,7 +42,12 @@ COMPOSE_FILE="docker/docker-compose.yml"
 if [ "${1:-}" = "--hotkeys" ] || [ "${1:-}" = "hotkeys" ]; then
     MODE="hotkeys"
     COMPOSE_FILE="docker/docker-compose-8.yml"
-    if [ -n "${2:-}" ]; then HOTKEYS_SECONDS="$2"; fi
+    if [ -n "${2:-}" ]; then
+        case "$2" in
+            ''|*[!0-9]*) echo "ERROR: --hotkeys seconds must be a positive integer, got: $2" >&2; exit 2 ;;
+            *) HOTKEYS_SECONDS="$2" ;;
+        esac
+    fi
 fi
 
 # Pin every connection to the local Docker cluster, independent of any .env.
