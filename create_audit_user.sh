@@ -93,9 +93,13 @@ FAILED=0
 for node in "${NODES[@]}"; do
     host="${node%:*}"; port="${node##*:}"
     printf '  %s ... ' "$node"
-    reply="$(redis-cli -h "$host" -p "$port" "${AUTH[@]}" \
-                 ACL SETUSER "$AUDIT_USER" on ">$AUDIT_PASS" "${GRANTS[@]}" 2>&1)"
-    if [ "$reply" = "OK" ]; then
+    # Run inside an `if` so `set -e` is suspended: redis-cli exits non-zero on a refused connection,
+    # and a bare `reply="$(…)"` would abort the whole run at the first unreachable node instead of
+    # recording it as FAILED and carrying on with the remaining nodes.
+    reply=""
+    if reply="$(redis-cli -h "$host" -p "$port" "${AUTH[@]}" \
+                    ACL SETUSER "$AUDIT_USER" on ">$AUDIT_PASS" "${GRANTS[@]}" 2>&1)" \
+       && [ "$reply" = "OK" ]; then
         case "$GRANT_HK" in
             [Yy]*) redis-cli -h "$host" -p "$port" "${AUTH[@]}" \
                        ACL SETUSER "$AUDIT_USER" +HOTKEYS >/dev/null 2>&1 || true ;;
