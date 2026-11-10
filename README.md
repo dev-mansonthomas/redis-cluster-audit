@@ -81,11 +81,15 @@ cp .env.example .env      # set REDIS_HOST_*/PORT_* (the node addresses)
 ./create_audit_user.sh    # prompts for the new password + admin credentials
 ```
 
-`create_audit_user.sh` provisions the user on every cluster node (discovered via `CLUSTER NODES`), using `audit.py --print-acl` as the single source of truth for the grants. To do it by hand instead, run that command and apply the printed `ACL SETUSER …` on each node:
+`create_audit_user.sh` provisions the user on every cluster node (discovered via `CLUSTER NODES`, or the `REDIS_HOST_*` seeds for a non-cluster server), using `audit.py --print-acl-grants` as the single source of truth for the grants. No secret ever appears on a `redis-cli` command line, where `ps` would show it. The admin password is passed through `REDISCLI_AUTH`. The audit password is hashed locally and sent as `#<sha256>` on stdin. Usernames are limited to letters, digits, `.`, `_` and `-`.
+
+To do it by hand instead, run this command and apply the printed `ACL SETUSER …` on each node:
 
 ```bash
 python audit.py --print-acl audit_ro YOUR_PASSWORD
 ```
+
+> ⚠️ `--print-acl` takes the password **as an argument**, so it lands in your shell history and is briefly visible in `ps`. The printed line also contains it in clear (`>password`). Prefer `./create_audit_user.sh`. If you do run it by hand, start the line with a space (bash `HISTCONTROL=ignorespace`, zsh `setopt HIST_IGNORE_SPACE`), or replace `>password` with `#<sha256 of the password>`.
 
 ### Step 2 — Finish configuring `.env`
 
