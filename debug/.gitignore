@@ -1,0 +1,4 @@
+# Local tool output (git-pr-merge / git-check reports, PR bodies, scratch). The folder is
+# tracked so tools can rely on it existing; everything inside stays local.
+*
+!.gitignore
