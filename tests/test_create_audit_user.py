@@ -56,7 +56,7 @@ FAKE_AUDIT_PY = 'print("~* &* nocommands +INFO +PING")\n'
 PROMPTS = "audit_ro\n{pw}\n{pw}\n\n\nN\n"
 
 
-def run_script(tmp_path, password="pw", refuse="", errreply=""):
+def run_script(tmp_path, password="pw", refuse="", errreply="", cluster_nodes=CLUSTER_NODES):
     proj = tmp_path / "proj"
     bindir = tmp_path / "bin"
     proj.mkdir()
@@ -74,7 +74,7 @@ def run_script(tmp_path, password="pw", refuse="", errreply=""):
         PATH=f"{bindir}{os.pathsep}{os.environ['PATH']}",
         PYTHON=sys.executable,
         FAKE_LOG=str(log),
-        FAKE_CLUSTER_NODES=CLUSTER_NODES,
+        FAKE_CLUSTER_NODES=cluster_nodes,
         FAKE_REFUSE=refuse,
         FAKE_ERRREPLY=errreply,
     )
@@ -82,7 +82,7 @@ def run_script(tmp_path, password="pw", refuse="", errreply=""):
     proc = subprocess.run(
         [str(proj / "create_audit_user.sh")],
         input=PROMPTS.format(pw=password),
-        capture_output=True, text=True, env=env, cwd=proj, timeout=60,
+        capture_output=True, text=True, env=env, cwd=proj, timeout=60, check=False,
     )
     calls = [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
     setuser_ports = [c[c.index("-p") + 1] for c in calls if "SETUSER" in c]
@@ -126,3 +126,18 @@ def test_password_with_spaces_stays_one_argument(tmp_path):
     setuser = next(c for c in calls if "SETUSER" in c)
     assert ">my pass" in setuser
     assert "my" not in setuser and "pass" not in setuser
+
+
+def test_node_flag_filter_matches_whole_tokens(tmp_path):
+    """`nofailover` is a healthy node and must be provisioned; only a confirmed `fail` (not the
+    merely-suspected PFAIL `fail?`, which is still reachable) is skipped."""
+    nodes = (
+        "id1 127.0.0.1:7001@17001 myself,master - 0 0 1 connected 0-5460\n"
+        "id2 127.0.0.1:7002@17002 master,nofailover - 0 0 2 connected 5461-10922\n"
+        "id3 127.0.0.1:7003@17003 master,fail - 0 0 3 connected 10923-16383\n"
+        "id4 127.0.0.1:7004@17004 slave,fail? id1 0 0 1 connected\n"
+        "id5 :0@0 noaddr,handshake - 0 0 0 disconnected\n"
+    )
+    proc, _, ports = run_script(tmp_path, cluster_nodes=nodes)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert ports == ["7001", "7002", "7004"]

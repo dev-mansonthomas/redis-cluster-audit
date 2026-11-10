@@ -1555,7 +1555,7 @@ def main():
     with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
         f.write(report)
 
-    print(f"  Report written to: {OUTPUT_FILE}")
+    print(f"  Report written to: {os.path.abspath(OUTPUT_FILE)}")
     print(f"\nAudit complete in {duration:.1f}s")
     print(f"\n{'=' * 50}")
     print(f"RECOMMENDATIONS ({len(recs)} total):")

@@ -64,9 +64,11 @@ if [ -n "$CLUSTER_OUT" ]; then
     while IFS= read -r line; do
         addr="$(printf '%s' "$line" | awk '{print $2}' | cut -d'@' -f1)"
         flags="$(printf '%s' "$line" | awk '{print $3}')"
-        # Skip nodes that aren't reachable targets: failed / no-address / still-handshaking, or a
-        # bogus ':0' / empty address — otherwise `redis-cli -h '' -p 0` fails the whole run.
-        case "$flags" in *fail*|*noaddr*|*handshake*) continue ;; esac
+        # Skip nodes that aren't reachable targets: confirmed-failed / no-address / still-handshaking,
+        # or a bogus ':0' / empty address — otherwise `redis-cli -h '' -p 0` fails the whole run.
+        # Match whole comma-delimited flag tokens: a bare *fail* would also drop healthy nodes flagged
+        # `nofailover`, and `fail?` (PFAIL — merely suspected) is still reachable so it is kept.
+        case ",$flags," in *,fail,*|*,noaddr,*|*,handshake,*) continue ;; esac
         h="${addr%:*}"; p="${addr##*:}"
         if [ -n "$h" ] && [ -n "$p" ] && [ "$p" != 0 ]; then NODES+=("$addr"); fi
     done <<< "$CLUSTER_OUT"
