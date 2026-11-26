@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Provision the read-only audit user on every node of a Redis cluster.
 #
 # Prompts for the new password (and admin credentials to connect with), then
@@ -7,6 +7,13 @@
 # REDIS_HOST_* seeds in .env for a non-cluster server.
 #
 # Usage: ./create_audit_user.sh
+
+# Requires bash >= 5 (macOS: Homebrew bash, `brew install bash`; /bin/bash there is 3.2). POSIX-only
+# syntax up to here, so an older or non-bash shell reaches this check and stops before doing anything.
+if [ -z "${BASH_VERSION:-}" ] || [ "${BASH_VERSION%%.*}" -lt 5 ]; then
+    echo "ERROR: bash >= 5 required (found: ${BASH_VERSION:-not bash}). On macOS: brew install bash" >&2
+    exit 1
+fi
 
 set -e
 cd "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

@@ -18,7 +18,7 @@ import audit
 
 ROOT = Path(__file__).resolve().parent.parent
 
-pytestmark = pytest.mark.skipif(not Path("/bin/bash").exists(), reason="needs /bin/bash")
+pytestmark = pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash on PATH")
 
 SENTINEL = 42
 

@@ -31,6 +31,8 @@ Recommendations now also cover: `noeviction` on a capped cache, an app connectin
 
 | Tool | Min version |
 |---|---|
+| Homebrew (macOS) | required on macOS: [brew.sh](https://brew.sh) |
+| bash | 5.x. macOS ships 3.2 as `/bin/bash`, so run `brew install bash`. The scripts use `#!/usr/bin/env bash` and refuse to run under bash < 5. |
 | Python | 3.10+ |
 | Docker Desktop | 4.x (local test fixture only) |
 | redis-cli | 6.x (cluster init + `create_audit_user.sh`) |
@@ -86,10 +88,11 @@ cp .env.example .env      # set REDIS_HOST_*/PORT_* (the node addresses)
 To do it by hand instead, run this command and apply the printed `ACL SETUSER …` on each node:
 
 ```bash
-python audit.py --print-acl audit_ro YOUR_PASSWORD
+python audit.py --print-acl audit_ro          # prompts for the password (hidden, asked twice)
+printf '%s' "$PW" | python audit.py --print-acl audit_ro   # or pipe it on stdin
 ```
 
-> ⚠️ `--print-acl` takes the password **as an argument**, so it lands in your shell history and is briefly visible in `ps`. The printed line also contains it in clear (`>password`). Prefer `./create_audit_user.sh`. If you do run it by hand, start the line with a space (bash `HISTCONTROL=ignorespace`, zsh `setopt HIST_IGNORE_SPACE`), or replace `>password` with `#<sha256 of the password>`.
+The printed line carries the password's SHA-256 (`on #<hash>`), never the plaintext. The password is never a command-line argument, so it stays out of your shell history and out of `ps`. The old form `--print-acl USER PASSWORD` is refused with exit code 2. Treat the hash as sensitive anyway: an unsalted SHA-256 of a weak password can be brute-forced.
 
 ### Step 2 — Finish configuring `.env`
 
@@ -196,6 +199,7 @@ CONFIG SET tcp-keepalive 60
 | `STOP — the Redis user has WRITE access` | You pointed the audit at a write-capable user. Use a read-only user (`./create_audit_user.sh`). The canary write is removed immediately. |
 | `pip: externally-managed-environment` (macOS/Homebrew) | Use the entry scripts (they create a `.venv`), or install inside a venv: `python3 -m venv .venv && source .venv/bin/activate`. |
 | `Cannot connect to the Docker daemon` | Start Docker Desktop before `local-test/run.sh`. |
+| `ERROR: bash >= 5 required` | macOS: `brew install bash`, then open a new terminal (`bash --version` should print 5.x). |
 | `redis-cli: command not found` | `brew install redis` (needed for the local fixture and `create_audit_user.sh`). |
 | Port `6777/6778/6779` already in use | A previous fixture is still up: `docker compose -f docker/docker-compose.yml down && docker compose -f docker/docker-compose-8.yml down`. |
 | `--hotkeys` shows "Redis < 8.6 — skipped" | HOTKEYS needs Redis ≥ 8.6; the default local fixture is 6.2.20 — use `local-test/run.sh --hotkeys` (Redis 8.10) or a real 8.6+ server. |

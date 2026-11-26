@@ -1,7 +1,7 @@
 """
 Integration tests for create_audit_user.sh.
 
-These run the REAL script (through its own #!/bin/bash shebang) in a throwaway directory, against a
+These run the REAL script (through its own `#!/usr/bin/env bash` shebang) in a throwaway directory, against a
 fake `redis-cli` that can refuse connections or return error replies. No Redis server is needed.
 
 The point of the suite: provisioning must be resilient to ONE bad node. The script runs under
@@ -22,7 +22,7 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = ROOT / "create_audit_user.sh"
 
-pytestmark = pytest.mark.skipif(not Path("/bin/bash").exists(), reason="needs /bin/bash")
+pytestmark = pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash on PATH")
 
 CLUSTER_NODES = (
     "id1 127.0.0.1:7001@17001 myself,master - 0 0 1 connected 0-5460\n"
