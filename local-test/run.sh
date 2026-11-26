@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # INTERNAL TEST FIXTURE — not the audit entry point.
 # Spins up a throwaway Redis cluster in Docker, seeds bad-practice data, and
 # runs the audit against it to exercise the tool end to end.
@@ -15,6 +15,13 @@
 # override the interpreter; otherwise a local .venv is created.
 #
 # Usage: bash local-test/run.sh [--hotkeys [SECONDS]]
+
+# Requires bash >= 5 (macOS: Homebrew bash, `brew install bash`; /bin/bash there is 3.2). POSIX-only
+# syntax up to here, so an older or non-bash shell reaches this check and stops before doing anything.
+if [ -z "${BASH_VERSION:-}" ] || [ "${BASH_VERSION%%.*}" -lt 5 ]; then
+    echo "ERROR: bash >= 5 required (found: ${BASH_VERSION:-not bash}). On macOS: brew install bash" >&2
+    exit 1
+fi
 
 set -e
 
@@ -83,7 +90,7 @@ echo ""
 
 # ── 4. Read-only user (grants are audit.py's single source of truth) ──────────
 echo "[4/6] Creating read-only audit user '$AUDIT_USER'..."
-ACL_CMD="$("$PY" audit.py --print-acl "$AUDIT_USER" "$AUDIT_PASS")"
+ACL_CMD="$(printf '%s' "$AUDIT_PASS" | "$PY" audit.py --print-acl "$AUDIT_USER")"
 for port in 6777 6778 6779; do
     echo "$ACL_CMD" | redis-cli -p "$port" > /dev/null
     echo "  :$port — OK"

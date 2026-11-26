@@ -27,17 +27,20 @@ rejects, so a correctly-provisioned audit makes no changes to production):
     11. Recommendations      — auto-generated, severity-ranked.
 """
 
+import argparse
+import getpass
+import hashlib
+import html
 import os
+import re
 import sys
 import time
-import html
-import argparse
-from collections import defaultdict, Counter
-from datetime import datetime
+from collections import Counter, defaultdict
+from datetime import datetime, timezone
 
 import redis
-from redis.cluster import RedisCluster, ClusterNode
 from dotenv import load_dotenv
+from redis.cluster import ClusterNode, RedisCluster
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -46,20 +49,20 @@ from dotenv import load_dotenv
 load_dotenv()
 
 STARTUP_NODES = [
-    ClusterNode(os.getenv("REDIS_HOST_1", "127.0.0.1"), int(os.getenv("REDIS_PORT_1", 6777))),
-    ClusterNode(os.getenv("REDIS_HOST_2", "127.0.0.1"), int(os.getenv("REDIS_PORT_2", 6778))),
-    ClusterNode(os.getenv("REDIS_HOST_3", "127.0.0.1"), int(os.getenv("REDIS_PORT_3", 6779))),
+    ClusterNode(os.getenv("REDIS_HOST_1", "127.0.0.1"), int(os.getenv("REDIS_PORT_1", "6777"))),
+    ClusterNode(os.getenv("REDIS_HOST_2", "127.0.0.1"), int(os.getenv("REDIS_PORT_2", "6778"))),
+    ClusterNode(os.getenv("REDIS_HOST_3", "127.0.0.1"), int(os.getenv("REDIS_PORT_3", "6779"))),
 ]
 PASSWORD         = os.getenv("REDIS_PASSWORD") or None
 USERNAME         = os.getenv("REDIS_USERNAME") or None
-BIG_KEY_TOP_N    = int(os.getenv("BIG_KEY_TOP_N", 30))
-SCAN_SAMPLE_SIZE = int(os.getenv("SCAN_SAMPLE_SIZE", 5000))
-SLOWLOG_ENTRIES  = int(os.getenv("SLOWLOG_MAX_ENTRIES", 25))
+BIG_KEY_TOP_N    = int(os.getenv("BIG_KEY_TOP_N", "30"))
+SCAN_SAMPLE_SIZE = int(os.getenv("SCAN_SAMPLE_SIZE", "5000"))
+SLOWLOG_ENTRIES  = int(os.getenv("SLOWLOG_MAX_ENTRIES", "25"))
 # MEMORY USAGE sampling depth. 0 = examine every element (exact but O(N) on the
 # server) — avoid on production; a small sample gives a good estimate cheaply.
-SCAN_MEMORY_SAMPLES = int(os.getenv("SCAN_MEMORY_SAMPLES", 5))
+SCAN_MEMORY_SAMPLES = int(os.getenv("SCAN_MEMORY_SAMPLES", "5"))
 # Warn when a single source IP holds more than this many connections (pool misconfig).
-CONN_PER_IP_WARN = int(os.getenv("CONN_PER_IP_WARN", 200))
+CONN_PER_IP_WARN = int(os.getenv("CONN_PER_IP_WARN", "200"))
 
 # LOCAL DOCKER ONLY — maps internal Docker bridge IPs back to 127.0.0.1:port
 # so MOVED redirects work from the Mac host. Set REDIS_DOCKER_REMAP=false for production.
@@ -105,6 +108,38 @@ def build_acl_setuser(user: str, password: str) -> str:
     return f"ACL SETUSER {user} on >{password} {build_acl_grants()}"
 
 
+# Same rule as create_audit_user.sh: the username ends up in a redis-cli command line, where
+# whitespace or quotes would be parsed as extra ACL rules (e.g. `x nopass +@all`).
+_SAFE_USERNAME = re.compile(r"[A-Za-z0-9._][A-Za-z0-9._-]*")
+
+
+def is_safe_username(user: str) -> bool:
+    return _SAFE_USERNAME.fullmatch(user) is not None
+
+
+def build_acl_setuser_hashed(user: str, password: str) -> str:
+    """`ACL SETUSER` line carrying the password's SHA-256 (`#<hex>`), so the plaintext is never
+    printed. Redis stores the same hash either way, and AUTH still takes the plaintext."""
+    digest = hashlib.sha256(password.encode("utf-8")).hexdigest()
+    return f"ACL SETUSER {user} on #{digest} {build_acl_grants()}"
+
+
+def _read_new_password(user: str) -> str:
+    """Prompt (hidden, confirmed) on a TTY; otherwise read stdin, dropping one trailing newline."""
+    if sys.stdin.isatty():
+        password = getpass.getpass(f"New password for '{user}': ")
+        if getpass.getpass("Confirm password: ") != password:
+            print("ERROR: passwords do not match.", file=sys.stderr)
+            sys.exit(1)
+    else:
+        password = sys.stdin.read()
+        password = password.removesuffix("\n").removesuffix("\r")
+    if not password:
+        print("ERROR: empty password is not allowed.", file=sys.stderr)
+        sys.exit(1)
+    return password
+
+
 READONLY_ACL_SCRIPT = (
     "-- Run this on every Redis node as an admin user:\n\n"
     + build_acl_setuser("audit_ro", "{YOUR_PASSWORD}")
@@ -119,17 +154,17 @@ READONLY_ACL_SCRIPT = (
 # ---------------------------------------------------------------------------
 
 def connect_cluster() -> RedisCluster:
-    kwargs = dict(
-        startup_nodes=STARTUP_NODES,
-        password=PASSWORD,
-        decode_responses=True,
+    kwargs = {
+        "startup_nodes": STARTUP_NODES,
+        "password": PASSWORD,
+        "decode_responses": True,
         # Tolerate partial slot coverage: an audit is often pointed at a
         # degraded cluster (a primary down / mid-resharding). This is the
         # real redis-py kwarg — skip_full_coverage_check is a legacy no-op.
-        require_full_coverage=False,
-        socket_timeout=10,
-        socket_connect_timeout=5,
-    )
+        "require_full_coverage": False,
+        "socket_timeout": 10,
+        "socket_connect_timeout": 5,
+    }
     if USERNAME:
         kwargs["username"] = USERNAME
     if _USE_DOCKER_REMAP:
@@ -139,13 +174,13 @@ def connect_cluster() -> RedisCluster:
 
 def node_direct_connection(node) -> redis.Redis:
     """Direct (non-cluster) connection to a single node for admin commands."""
-    kwargs = dict(
-        host=node.host,
-        port=node.port,
-        password=PASSWORD,
-        decode_responses=True,
-        socket_timeout=10,
-    )
+    kwargs = {
+        "host": node.host,
+        "port": node.port,
+        "password": PASSWORD,
+        "decode_responses": True,
+        "socket_timeout": 10,
+    }
     if USERNAME:
         kwargs["username"] = USERNAME
     return redis.Redis(**kwargs)
@@ -176,13 +211,15 @@ def check_permissions(rc: RedisCluster):
         raise
 
     # The write succeeded — this user has write access. Undo it right away.
+    # Only Redis errors are tolerated here (e.g. UNLINK unknown on a pre-4.0 server → fall back to
+    # DEL); a programming error must surface. If both fail, say so — the key still expires (EX 5).
     try:
         rc.unlink(CANARY)
-    except Exception:
+    except redis.exceptions.RedisError:
         try:
             rc.delete(CANARY)
-        except Exception:
-            pass
+        except redis.exceptions.RedisError as e:
+            print(f"WARNING: could not remove the canary key {CANARY!r} ({e}); it expires in 5s.")
 
     print("\n" + "=" * 70)
     print("STOP — the Redis user has WRITE access.")
@@ -234,7 +271,7 @@ def collect_slowlog(r: redis.Redis) -> list:
             "duration_us": e.get("duration"),
             "duration_ms": round(e.get("duration", 0) / 1000, 2),
             "command":     " ".join(str(a) for a in e.get("command", [])) if isinstance(e.get("command"), (list, tuple)) else str(e.get("command", "")),
-            "timestamp":   datetime.fromtimestamp(e.get("start_time", 0)).strftime("%Y-%m-%d %H:%M:%S"),
+            "timestamp":   datetime.fromtimestamp(e.get("start_time", 0), tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
         }
         for e in entries
     ]
@@ -377,7 +414,7 @@ def _parse_acl_entry(entry: str) -> dict:
     has_password = any(p.startswith("#") for p in parts)
     key_patterns = [p for p in parts if p.startswith("~")]
     chan_patterns = [p for p in parts if p.startswith("&")]
-    commands     = [p for p in parts if p.startswith("+") or p.startswith("-")]
+    commands     = [p for p in parts if p.startswith(("+", "-"))]
 
     return {
         "name":             name,
@@ -1407,7 +1444,7 @@ def section_hotkeys(all_node_data: list) -> str:
 
 
 def build_html_report(all_node_data, conn_analysis, keyspace, stats, security, recs, duration_s) -> str:
-    generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     nodes_str    = ", ".join(nd["label"] for nd in all_node_data)
     version      = all_node_data[0]["info"].get("redis_version", "?")
     return f"""<!DOCTYPE html>
@@ -1458,8 +1495,10 @@ def _positive_int(s):
 def main():
     parser = argparse.ArgumentParser(description="Read-only audit of a Redis OSS cluster.")
     parser.add_argument(
-        "--print-acl", nargs=2, metavar=("USER", "PASSWORD"),
-        help="Print the ACL SETUSER line for a read-only audit user, then exit.",
+        "--print-acl", nargs="+", metavar="USER",
+        help="Print the ACL SETUSER line for a read-only audit user, then exit. The password is "
+             "prompted (hidden) on a terminal, or read from stdin when piped; the line carries its "
+             "SHA-256 (#<hash>), never the plaintext.",
     )
     parser.add_argument(
         "--print-acl-grants", action="store_true",
@@ -1473,7 +1512,16 @@ def main():
     )
     args = parser.parse_args()
     if args.print_acl:
-        print(build_acl_setuser(args.print_acl[0], args.print_acl[1]))
+        if len(args.print_acl) > 1:
+            parser.error(
+                "--print-acl no longer takes the password as an argument (it would leak into shell "
+                "history and `ps`). Run `audit.py --print-acl USER` to be prompted, or pipe it on "
+                "stdin: printf '%s' \"$PW\" | audit.py --print-acl USER")
+        user = args.print_acl[0]
+        if not is_safe_username(user):
+            parser.error(f"invalid username {user!r}: use only letters, digits, '.', '_' or '-' "
+                         "(not leading '-').")
+        print(build_acl_setuser_hashed(user, _read_new_password(user)))
         return
     if args.print_acl_grants:
         print(build_acl_grants())
@@ -1486,7 +1534,7 @@ def main():
     print("Connecting to cluster...")
     try:
         rc = connect_cluster()
-    except Exception as e:
+    except (redis.exceptions.RedisError, redis.exceptions.RedisClusterException) as e:
         print(f"ERROR: Cannot connect — {e}")
         sys.exit(1)
     print("  Connected.\n")
@@ -1550,7 +1598,7 @@ def main():
     recs    += analyse_hotkeys(all_node_data)
     duration = time.time() - t_start
 
-    print(f"\nGenerating HTML report...")
+    print("\nGenerating HTML report...")
     report   = build_html_report(all_node_data, conn_analysis, keyspace, stats, security, recs, duration)
     with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
         f.write(report)

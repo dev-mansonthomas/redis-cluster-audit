@@ -39,3 +39,13 @@ def test_has_ttl_percentage_uses_real_count_not_subtraction():
     assert "30%" in html          # has_ttl (real count), green only
     assert "60%" not in html      # the old 100 - no_ttl_pct bug
     assert "Expired" in html      # the third bucket is surfaced
+
+
+def test_slowlog_timestamps_are_explicit_utc():
+    """Timestamps are rendered in UTC and labelled, not in the auditor's implicit local time."""
+    class _R:
+        def slowlog_get(self, n):
+            return [{"id": 1, "duration": 1500, "command": ["GET", "k"], "start_time": 0}]
+
+    [entry] = audit.collect_slowlog(_R())
+    assert entry["timestamp"] == "1970-01-01 00:00:00 UTC"

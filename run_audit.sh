@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Entry point — run the read-only Redis audit against the servers in .env.
 #
 #   ./run_audit.sh                  read-only audit  -> report.html
@@ -6,6 +6,13 @@
 #
 # Sets up a local .venv, installs dependencies, validates .env, then runs the
 # audit. Extra arguments are passed through to audit.py.
+
+# Requires bash >= 5 (macOS: Homebrew bash, `brew install bash`; /bin/bash there is 3.2). POSIX-only
+# syntax up to here, so an older or non-bash shell reaches this check and stops before doing anything.
+if [ -z "${BASH_VERSION:-}" ] || [ "${BASH_VERSION%%.*}" -lt 5 ]; then
+    echo "ERROR: bash >= 5 required (found: ${BASH_VERSION:-not bash}). On macOS: brew install bash" >&2
+    exit 1
+fi
 
 set -e
 cd "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

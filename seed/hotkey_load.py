@@ -16,12 +16,12 @@ Usage: python seed/hotkey_load.py [duration_seconds] [key] [threads]
 
 import os
 import sys
-import time
 import threading
+import time
 
 import redis
-from redis.cluster import RedisCluster, ClusterNode
 from dotenv import load_dotenv
+from redis.cluster import ClusterNode, RedisCluster
 
 load_dotenv()
 
@@ -40,13 +40,13 @@ USERNAME = os.getenv("REDIS_USERNAME") or None
 
 
 def _client() -> RedisCluster:
-    kwargs = dict(
-        startup_nodes=STARTUP_NODES,
-        password=PASSWORD,
-        decode_responses=True,
-        require_full_coverage=False,
-        address_remap=lambda addr: DOCKER_ADDR_REMAP.get(addr, addr),
-    )
+    kwargs = {
+        "startup_nodes": STARTUP_NODES,
+        "password": PASSWORD,
+        "decode_responses": True,
+        "require_full_coverage": False,
+        "address_remap": lambda addr: DOCKER_ADDR_REMAP.get(addr, addr),
+    }
     if USERNAME:
         kwargs["username"] = USERNAME
     return RedisCluster(**kwargs)

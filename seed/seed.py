@@ -12,11 +12,13 @@ What it creates:
     running expensive commands (HGETALL on a big hash, SMEMBERS on a big set)
 """
 
+import contextlib
 import os
 import sys
+
 import redis
-from redis.cluster import RedisCluster, ClusterNode
 from dotenv import load_dotenv
+from redis.cluster import ClusterNode, RedisCluster
 
 load_dotenv()
 
@@ -40,13 +42,13 @@ USERNAME = os.getenv("REDIS_USERNAME") or None
 
 
 def connect():
-    kwargs = dict(
-        startup_nodes=STARTUP_NODES,
-        password=PASSWORD,
-        decode_responses=True,
-        require_full_coverage=False,
-        address_remap=lambda addr: DOCKER_ADDR_REMAP.get(addr, addr),
-    )
+    kwargs = {
+        "startup_nodes": STARTUP_NODES,
+        "password": PASSWORD,
+        "decode_responses": True,
+        "require_full_coverage": False,
+        "address_remap": lambda addr: DOCKER_ADDR_REMAP.get(addr, addr),
+    }
     if USERNAME:
         kwargs["username"] = USERNAME
     rc = RedisCluster(**kwargs)
@@ -58,13 +60,13 @@ def get_direct_node_connections(rc):
     """Direct connections to each primary for CONFIG SET / admin commands."""
     nodes = []
     for node in rc.get_primaries():
-        kwargs = dict(
-            host=node.host,
-            port=node.port,
-            password=PASSWORD,
-            decode_responses=True,
-            socket_timeout=5,
-        )
+        kwargs = {
+            "host": node.host,
+            "port": node.port,
+            "password": PASSWORD,
+            "decode_responses": True,
+            "socket_timeout": 5,
+        }
         if USERNAME:
             kwargs["username"] = USERNAME
         nodes.append(redis.Redis(**kwargs))
@@ -146,22 +148,16 @@ def trigger_slow_logs(node_connections):
         try:
             # These are the exact commands that cause slowness in production:
             # HGETALL on a large hash fetches all fields in one blocking call.
-            try:
+            with contextlib.suppress(redis.exceptions.ResponseError):  # MOVED: key on another shard
                 r.execute_command("HGETALL", "app:customer:BIG-HASH-2000")
-            except Exception:
-                pass
 
             # SMEMBERS on a large set returns all members at once (O(N)).
-            try:
+            with contextlib.suppress(redis.exceptions.ResponseError):  # MOVED: key on another shard
                 r.execute_command("SMEMBERS", "app:permissions:BIG-SET-2000")
-            except Exception:
-                pass
 
             # LRANGE fetching an entire large list
-            try:
+            with contextlib.suppress(redis.exceptions.ResponseError):  # MOVED: key on another shard
                 r.execute_command("LRANGE", "app:auditlog:BIG-LIST-5000", 0, -1)
-            except Exception:
-                pass
         finally:
             # Always restore the threshold, even if a command above raised,
             # so we never leave the node logging every command permanently.
@@ -179,10 +175,8 @@ def trigger_hot_key(rc, node_connections):
         r.config_set("slowlog-log-slower-than", 0)
     try:
         for _ in range(20):
-            try:
+            with contextlib.suppress(redis.exceptions.RedisError):  # demo load: best effort
                 rc.get("app:cache:bigobject:1mb")
-            except Exception:
-                pass
     finally:
         for r, original in originals:
             r.config_set("slowlog-log-slower-than", original)
@@ -193,7 +187,7 @@ def main():
     print("Connecting to local Redis cluster...")
     try:
         rc = connect()
-    except Exception as e:
+    except (redis.exceptions.RedisError, redis.exceptions.RedisClusterException) as e:
         print(f"ERROR: Cannot connect to cluster — {e}")
         print("Make sure the Docker cluster is running: cd docker && docker-compose up -d")
         print("Then initialise it: bash docker/init-cluster.sh")
