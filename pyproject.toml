@@ -14,3 +14,6 @@ classifiers = [
 pythonpath = ["."]
 testpaths = ["tests"]
 addopts = "-q"
+
+[tool.ruff]
+target-version = "py310"

@@ -1,6 +1,23 @@
 """Shared test fixtures — fake Redis clients so unit tests need no live server."""
 
+import os
+
 import pytest
+
+
+def pytest_sessionfinish(session, exitstatus):
+    """With CI_FORBID_SKIPS=1 (set by the CI workflow), a skipped test fails the run: a missing tool
+    on a runner must not turn into a green build that tested nothing."""
+    if os.environ.get("CI_FORBID_SKIPS") != "1":
+        return
+    reporter = session.config.pluginmanager.get_plugin("terminalreporter")
+    skipped = reporter.stats.get("skipped", []) if reporter else []
+    if not skipped:
+        return
+    reporter.write_line(f"CI_FORBID_SKIPS=1: {len(skipped)} skipped test(s) are not allowed:", red=True)
+    for rep in skipped:
+        reporter.write_line(f"  {rep.nodeid}: {rep.longrepr[-1] if isinstance(rep.longrepr, tuple) else ''}")
+    session.exitstatus = pytest.ExitCode.TESTS_FAILED
 
 
 class _FakePipeline:
