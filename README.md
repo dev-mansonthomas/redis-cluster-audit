@@ -1,5 +1,7 @@
 # redis-cluster-audit
 
+[![CI](https://github.com/dev-mansonthomas/redis-cluster-audit/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/dev-mansonthomas/redis-cluster-audit/actions/workflows/ci.yml)
+
 A read-only audit script for Redis OSS clusters. Connects to a Redis Cluster, collects performance and security data across all shards, and produces a self-contained HTML report.
 
 Read-only by design: it requires a read-only user, and the only write it attempts is a self-expiring canary in its permission check — which a read-only user rejects. If that write unexpectedly succeeds, the key is removed immediately (UNLINK) and the audit aborts before doing anything else.
@@ -131,6 +133,7 @@ redis-cluster-audit/
 ├── requirements.txt
 ├── .env.example             ← production config template
 ├── tests/                   ← unit tests (pytest, no server needed)
+├── .github/workflows/ci.yml ← CI: pytest (Linux + macOS), ruff, shellcheck
 ├── local-test/
 │   └── run.sh               ← Docker integration fixture (NOT the entry point)
 ├── docker/
@@ -214,6 +217,34 @@ The unit tests use fake Redis clients, so no live server or Docker is needed:
 pip install -r requirements-dev.txt
 pytest
 ```
+
+`requirements-dev.txt` pins the dev tools (`ruff`, `PyYAML`), so your machine and CI run the same versions.
+
+---
+
+## Continuous integration
+
+GitHub Actions (`.github/workflows/ci.yml`) runs on every pull request to `main` and every push to `main`. It needs no Redis server and no Docker:
+
+| Check | What it runs |
+|---|---|
+| `test (ubuntu-latest, 3.10)` | `pytest -rs` on the oldest supported Python |
+| `test (ubuntu-latest, 3.14)` | `pytest -rs` on the latest stable Python |
+| `test (macos-latest, 3.14)` | `pytest -rs` with Homebrew bash 5, as on a Mac. Also checks that the stock `/bin/bash` 3.2 is refused. |
+| `lint` | `ruff check .` and `shellcheck` on every tracked `*.sh` |
+
+In CI a skipped test fails the run (`CI_FORBID_SKIPS=1`), so a missing tool can't pass as green. To reproduce CI locally:
+
+```bash
+CI_FORBID_SKIPS=1 python -m pytest -rs
+```
+```bash
+ruff check . && git ls-files -z -- '*.sh' | xargs -0 shellcheck
+```
+
+The Docker fixture (`local-test/run.sh`) is not run in CI. Run it locally before changes that touch the audit's Redis calls.
+
+Optional: to block merges on a red build, open the repository on GitHub, go to **Settings → Branches → Add branch protection rule** for `main`, enable **Require status checks to pass**, and select the four checks above.
 
 ---
 
