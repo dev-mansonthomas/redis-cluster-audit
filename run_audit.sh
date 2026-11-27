@@ -15,6 +15,8 @@ if [ -z "${BASH_VERSION:-}" ] || [ "${BASH_VERSION%%.*}" -lt 5 ]; then
 fi
 
 set -e
+# THROWAWAY: unquoted expansion, shellcheck SC2086 must fail the lint job
+NEGATIVE_CHECK="a b"; echo $NEGATIVE_CHECK >/dev/null
 cd "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # ── Python environment (honour $PYTHON, else create a local .venv) ────────────
